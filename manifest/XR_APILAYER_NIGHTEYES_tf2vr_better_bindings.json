@@ -1,0 +1,11 @@
+{
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_NIGHTEYES_tf2vr_better_bindings",
+        "library_path": ".\\TF2VRBetterBindingsLayer.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "TF2VR Better Bindings: extra SteamVR actions for Titanfall 2 VR (only active in Titanfall2VRLauncher.exe)",
+        "disable_environment": "DISABLE_TF2VR_BETTER_BINDINGS"
+    }
+}
