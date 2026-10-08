@@ -27,6 +27,8 @@ constexpr const char* kMenuActiveVar = "tf2vrbb_menu_active";
 constexpr const char* kStartupPhaseVar = "tf2vrbb_startup_phase";
 constexpr const char* kReloadHighlightVar = "tf2vr_reload_highlight";
 constexpr const char* kGunAckVar = "tf2vr_gun_ack";
+constexpr const char* kGrenadeAckVar = "tf2vr_grenade_ack";
+constexpr const char* kGunGripToggleVar = "tf2vr_toggle_grip";
 constexpr float kHeldThreshold = 0.5f;
 constexpr const char* kGameplaySetName = "gameplay";
 constexpr const char* kSqueezeActionName = "squeeze";
@@ -43,10 +45,11 @@ constexpr const char* kCrouchActionName = "tf2vr_crouch";
 constexpr const char* kCrouchLocalizedName = "Crouch";
 constexpr const char* kTacticalActionName = "tf2vr_tactical";
 constexpr const char* kTacticalLocalizedName = "Tactical Ability (Cloak)";
-constexpr const char* kToggleGripActionName = "tf2vr_grip_lock";
-constexpr const char* kToggleGripLocalizedName = "Toggle Grip";
-constexpr const char* kToggleGripBindingLeft = "/user/hand/left/input/squeeze/value";
-constexpr const char* kToggleGripBindingRight = "/user/hand/right/input/squeeze/value";
+constexpr const char* kReloadGrabActionName = "tf2vr_reload_grab";
+constexpr const char* kReloadGrabLocalizedName = "Reload Grab";
+constexpr std::chrono::milliseconds kGunGrabWindow{500};
+constexpr std::chrono::milliseconds kReloadEndGrace{200};
+constexpr std::chrono::milliseconds kGrenadeMinPress{150};
 constexpr const char* kIndexProfile = "/interaction_profiles/valve/index_controller";
 constexpr int kMaxLoggedQueries = 8;
 
@@ -94,17 +97,18 @@ struct GripSlot
 {
     XrPath path = XR_NULL_PATH;
     const char* name = "";
-    bool enabled = false;
     bool sampled = false;
-    bool toggleActive = false;
-    bool toggleOn = false;
-    bool lockInverted = false;
-    bool lockReleased = false;
+    bool routed = false;
     float output = 0.0f;
     bool changed = false;
     XrTime changeTime = 0;
     bool held = false;
-    uint64_t heldSince = 0;
+    std::chrono::steady_clock::time_point heldAt;
+    bool grabBound = false;
+    bool rawPressed = false;
+    std::chrono::steady_clock::time_point pressAt;
+    bool grenadeHeld = false;
+    bool waitRelease = false;
 };
 
 struct ButtonState
@@ -133,6 +137,8 @@ struct TriggerOverride
 {
     bool applies = false;
     bool blocked = false;
+    bool reloadBlocked = false;
+    bool waitRelease = false;
     float output = 0.0f;
     bool changed = false;
     XrTime changeTime = 0;
@@ -150,8 +156,6 @@ struct LayerState
     XrPath rightHand = XR_NULL_PATH;
     XrPath indexProfile = XR_NULL_PATH;
     XrPath crouchBinding = XR_NULL_PATH;
-    XrPath toggleBindingLeft = XR_NULL_PATH;
-    XrPath toggleBindingRight = XR_NULL_PATH;
     XrPath tacticalHand = XR_NULL_PATH;
     XrAction squeeze = XR_NULL_HANDLE;
     XrAction aim = XR_NULL_HANDLE;
@@ -174,7 +178,7 @@ struct LayerState
     bool loggedAimLocate = false;
     SprintState sprint;
     XrAction trigger = XR_NULL_HANDLE;
-    XrAction toggleGrip = XR_NULL_HANDLE;
+    XrAction reloadGrab = XR_NULL_HANDLE;
     XrAction crouch = XR_NULL_HANDLE;
     XrAction tactical = XR_NULL_HANDLE;
     std::vector<GripSlot> grips;
@@ -188,11 +192,18 @@ struct LayerState
     GameVar startupPhaseVar{kStartupPhaseVar};
     GameVar reloadHighlightVar{kReloadHighlightVar};
     GameVar gunAckVar{kGunAckVar};
+    GameVar grenadeAckVar{kGrenadeAckVar};
+    GameVar gunGripToggleVar{kGunGripToggleVar};
     int menuState = -2;
     int startupPhase = -2;
     int reloadHighlight = 0;
+    bool reloadWaiting = false;
+    std::chrono::steady_clock::time_point reloadSeenAt;
     bool gunAckKnown = false;
     int gunAck = 0;
+    bool grenadeAckKnown = false;
+    int grenadeAck = 0;
+    bool grenadeToggleActive = false;
     XrPath gunHand = XR_NULL_PATH;
     uint64_t frame = 0;
     int loggedSqueezeQueries = 0;
@@ -249,8 +260,7 @@ void InitializeOnce()
 
         LogOpen(s.directory + L"\\" + kLogFileName);
         Log("layer active in %s", NarrowPath(process).c_str());
-        Log("config: toggle_left=%d toggle_right=%d reload_guard=%d lock_mode=%s", s.config.toggleLeft, s.config.toggleRight, s.config.reloadGuard,
-            s.config.lockMode.c_str());
+        Log("config: reload_grab=%d grenade_toggle=%d", s.config.reloadGrabEnabled, s.config.grenadeToggle);
         Log("config: crouch=%d binding=%s press_cmd='%s' release_cmd='%s'", s.config.crouchEnabled, s.config.crouchBinding.c_str(),
             s.config.crouchPressCommand.c_str(), s.config.crouchReleaseCommand.c_str());
         Log("config: crouch mode=%s uncrouch_on_jump=%d jump_delay_ms=%d", s.config.crouchMode.c_str(), s.config.crouchUncrouchOnJump,
@@ -331,11 +341,10 @@ void ConfigureGrips(LayerState& s, const XrActionCreateInfo& info)
         GripSlot grip;
         grip.path = path;
         grip.name = left ? "left" : "right";
-        grip.enabled = left ? s.config.toggleLeft : s.config.toggleRight;
         s.grips.push_back(grip);
     }
     for (const GripSlot& grip : s.grips)
-        Log("squeeze slot %s path=%s toggle=%d", grip.name, PathText(s, grip.path).c_str(), grip.enabled);
+        Log("squeeze slot %s path=%s", grip.name, PathText(s, grip.path).c_str());
 }
 
 const char* HandName(const LayerState& s, XrPath hand)
@@ -343,11 +352,11 @@ const char* HandName(const LayerState& s, XrPath hand)
     return hand == s.leftHand ? "left" : hand == s.rightHand ? "right" : "unknown";
 }
 
-void TrackHeld(const LayerState& s, GripSlot& grip, float output)
+void TrackHeld(GripSlot& grip, float output)
 {
     bool held = output > kHeldThreshold;
     if (held && !grip.held)
-        grip.heldSince = s.frame;
+        grip.heldAt = std::chrono::steady_clock::now();
     grip.held = held;
 }
 
@@ -356,80 +365,149 @@ void UpdateReloadState(LayerState& s)
     int highlight = 0;
     if (!s.reloadHighlightVar.ReadInt(highlight))
         highlight = 0;
-    if (highlight == s.reloadHighlight)
+    if (highlight != s.reloadHighlight)
+    {
+        Log("reload highlight %d", highlight);
+        s.reloadHighlight = highlight;
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (highlight != 0)
+        s.reloadSeenAt = now;
+    bool waiting = highlight != 0 || (s.reloadWaiting && now - s.reloadSeenAt < kReloadEndGrace);
+    if (waiting == s.reloadWaiting)
         return;
-    Log("reload highlight %d: %s", highlight, highlight != 0 ? "reload waiting" : "no reload waiting");
-    s.reloadHighlight = highlight;
+    Log("reload %s", waiting ? "started" : "finished");
+    s.reloadWaiting = waiting;
 }
 
-void UpdateGrips(LayerState& s, XrSession session)
+void UpdateSqueeze(LayerState& s, XrSession session)
 {
-    bool reloadWaiting = s.config.reloadGuard && s.reloadHighlight != 0;
-    bool buttonMode = s.config.lockMode == "button";
     for (GripSlot& grip : s.grips)
     {
-        grip.changed = false;
-        grip.sampled = false;
-
         XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
         get.action = s.squeeze;
         get.subactionPath = grip.path;
         XrActionStateFloat squeeze{XR_TYPE_ACTION_STATE_FLOAT};
         bool squeezeActive = XR_SUCCEEDED(s.next.getActionStateFloat(session, &get, &squeeze)) && squeeze.isActive;
         float raw = squeezeActive ? squeeze.currentState : 0.0f;
-        if (!grip.enabled)
+
+        bool grabbing = false;
+        XrTime grabTime = 0;
+        grip.grabBound = false;
+        if (s.reloadGrab != XR_NULL_HANDLE)
         {
-            TrackHeld(s, grip, raw);
-            continue;
+            get.action = s.reloadGrab;
+            XrActionStateBoolean grab{XR_TYPE_ACTION_STATE_BOOLEAN};
+            grip.grabBound = XR_SUCCEEDED(s.next.getActionStateBoolean(session, &get, &grab)) && grab.isActive;
+            grabbing = grip.grabBound && grab.currentState;
+            grabTime = grab.lastChangeTime;
         }
 
-        XrActionStateBoolean toggle{XR_TYPE_ACTION_STATE_BOOLEAN};
-        get.action = s.toggleGrip;
-        grip.toggleActive = s.toggleGrip != XR_NULL_HANDLE && XR_SUCCEEDED(s.next.getActionStateBoolean(session, &get, &toggle)) && toggle.isActive;
-        bool toggleOn = grip.toggleActive && toggle.currentState == XR_TRUE;
-        if (!squeezeActive && !grip.toggleActive)
-        {
-            TrackHeld(s, grip, 0.0f);
-            continue;
-        }
+        auto now = std::chrono::steady_clock::now();
+        bool rawPressed = raw > kHeldThreshold;
+        bool rawEdge = rawPressed && !grip.rawPressed;
+        if (rawEdge)
+            grip.pressAt = now;
+        grip.rawPressed = rawPressed;
 
-        grip.sampled = true;
-        bool toggleChanged = toggleOn != grip.toggleOn;
-        if (toggleChanged)
-            Log("grip %s %s", grip.name, toggleOn ? "on" : "off");
-        grip.toggleOn = toggleOn;
-        bool guarded = reloadWaiting && grip.path != s.gunHand;
-        bool locked = false;
-        if (buttonMode)
+        bool routed = s.reloadGrab != XR_NULL_HANDLE && s.reloadWaiting && grip.path != s.gunHand && !grip.grenadeHeld;
+        if (routed != grip.routed)
+            Log("%s hand: %s", grip.name, routed ? "grip blocked, reload grab active" : "grip restored");
+        grip.routed = routed;
+
+        float output = raw;
+        if (grip.grenadeHeld)
         {
-            if (guarded && toggleOn && !grip.lockReleased)
+            output = rawEdge ? 0.0f : 1.0f;
+            if (rawEdge)
             {
-                grip.lockReleased = true;
-                Log(toggleChanged ? "grip %s lock ignored until let go (support hand, reload waiting)" : "grip %s released by the reload until let go", grip.name);
+                grip.grenadeHeld = false;
+                grip.waitRelease = true;
+                Log("%s hand: grenade let go", grip.name);
             }
-            else if (!toggleOn && grip.lockReleased)
-                grip.lockReleased = false;
-            locked = toggleOn && !grip.lockReleased;
         }
-        else
+        else if (grip.waitRelease)
         {
-            if (guarded && toggleOn != grip.lockInverted)
-            {
-                grip.lockInverted = toggleOn;
-                Log(toggleChanged ? "grip %s lock ignored (support hand, reload waiting)" : "grip %s released by the reload, next press grabs", grip.name);
-            }
-            else if (toggleChanged && grip.lockInverted)
-                Log("grip %s lock %s (press after a reload)", grip.name, toggleOn != grip.lockInverted ? "grabs" : "releases");
-            locked = toggleOn != grip.lockInverted;
+            output = 0.0f;
+            if (!rawPressed)
+                grip.waitRelease = false;
         }
-
-        float output = locked ? 1.0f : raw;
+        else if (routed)
+        {
+            output = grabbing ? 1.0f : 0.0f;
+        }
+        else if (s.grenadeToggleActive && !rawPressed && grip.output > kHeldThreshold && now - grip.pressAt < kGrenadeMinPress)
+        {
+            output = grip.output;
+        }
         grip.changed = output != grip.output;
+        grip.sampled = routed || grip.changed || output != raw;
         if (grip.changed)
-            grip.changeTime = toggleChanged || !squeezeActive ? toggle.lastChangeTime : squeeze.lastChangeTime;
+            grip.changeTime = routed ? grabTime : squeeze.lastChangeTime;
         grip.output = output;
-        TrackHeld(s, grip, output);
+        TrackHeld(grip, output);
     }
+}
+
+const GripSlot* RecentGrab(const LayerState& s)
+{
+    auto now = std::chrono::steady_clock::now();
+    const GripSlot* newest = nullptr;
+    for (const GripSlot& grip : s.grips)
+        if (now - grip.heldAt <= kGunGrabWindow && (!newest || grip.heldAt > newest->heldAt))
+            newest = &grip;
+    return newest;
+}
+
+void UpdateGrenade(LayerState& s)
+{
+    int toggle = 0;
+    if (!s.gunGripToggleVar.ReadInt(toggle))
+        toggle = 0;
+    bool active = s.config.grenadeToggle && toggle == 1;
+    if (active != s.grenadeToggleActive)
+        Log("grenade toggle %s", active ? "on (Gun Grip is Toggle)" : "off");
+    s.grenadeToggleActive = active;
+
+    if (!active || s.menuState != 0)
+    {
+        for (GripSlot& grip : s.grips)
+        {
+            if (grip.grenadeHeld)
+                Log("%s hand: grenade toggle cleared", grip.name);
+            grip.grenadeHeld = false;
+        }
+    }
+
+    int ack = 0;
+    if (!s.grenadeAckVar.ReadInt(ack))
+        return;
+    if (!s.grenadeAckKnown)
+    {
+        s.grenadeAckKnown = true;
+        s.grenadeAck = ack;
+        return;
+    }
+    if (ack == s.grenadeAck)
+        return;
+    s.grenadeAck = ack;
+    if (ack <= 0 || !active)
+        return;
+
+    const GripSlot* recent = RecentGrab(s);
+    if (!recent)
+    {
+        Log("grenade ack %d: no recent grab", ack);
+        return;
+    }
+    GripSlot& grip = *std::find_if(s.grips.begin(), s.grips.end(), [recent](const GripSlot& g) { return &g == recent; });
+    if (grip.output <= kHeldThreshold)
+    {
+        Log("grenade ack %d: %s hand already let go", ack, grip.name);
+        return;
+    }
+    grip.grenadeHeld = true;
+    Log("grenade ack %d: %s hand holds the grenade until the next grip press", ack, grip.name);
 }
 
 void UpdateGunHand(LayerState& s)
@@ -449,13 +527,10 @@ void UpdateGunHand(LayerState& s)
     if (ack <= 0)
         return;
 
-    const GripSlot* newest = nullptr;
-    for (const GripSlot& grip : s.grips)
-        if (grip.held && (!newest || grip.heldSince > newest->heldSince))
-            newest = &grip;
+    const GripSlot* newest = RecentGrab(s);
     if (!newest)
     {
-        Log("gun ack %d: no hand gripping, gun hand stays %s", ack, HandName(s, s.gunHand));
+        Log("gun ack %d: no recent grab, gun hand stays %s", ack, HandName(s, s.gunHand));
         return;
     }
     s.gunHand = newest->path;
@@ -593,7 +668,7 @@ void UpdateTriggerOverride(LayerState& s, XrSession session)
 {
     TriggerOverride& o = s.triggerOverride;
     o.changed = false;
-    if (s.trigger == XR_NULL_HANDLE || s.tacticalHand == XR_NULL_PATH || !s.tacticalButton.active)
+    if (s.trigger == XR_NULL_HANDLE || s.tacticalHand == XR_NULL_PATH)
     {
         o.applies = false;
         return;
@@ -604,11 +679,36 @@ void UpdateTriggerOverride(LayerState& s, XrSession session)
     get.subactionPath = s.tacticalHand;
     XrActionStateFloat raw{XR_TYPE_ACTION_STATE_FLOAT};
     bool rawActive = XR_SUCCEEDED(s.next.getActionStateFloat(session, &get, &raw)) && raw.isActive;
+    bool rawPressed = rawActive && raw.currentState > kHeldThreshold;
 
-    bool blocked = s.config.tacticalBlockHandTrigger && s.menuState == 0;
-    if (blocked != o.blocked)
-        Log("%s trigger %s", HandName(s, s.tacticalHand), blocked ? "blocked (gameplay, tactical bound)" : "passes through");
-    o.blocked = blocked;
+    const GripSlot* support = FindGrip(s, s.tacticalHand);
+    bool reloadBlock = s.menuState == 0 && s.reloadWaiting && support && support->grabBound;
+    if (o.reloadBlocked && !reloadBlock && !s.reloadWaiting && rawPressed && !o.waitRelease)
+    {
+        o.waitRelease = true;
+        Log("%s trigger held back until released", HandName(s, s.tacticalHand));
+    }
+    if (o.waitRelease && !rawPressed)
+        o.waitRelease = false;
+    if (reloadBlock != o.reloadBlocked)
+        Log("%s trigger %s", HandName(s, s.tacticalHand), reloadBlock ? "blocked (reload)" : "no longer blocked by the reload");
+    o.reloadBlocked = reloadBlock;
+
+    bool tacticalBound = s.tacticalButton.active;
+    if (!tacticalBound && !reloadBlock && !o.waitRelease)
+    {
+        o.applies = false;
+        return;
+    }
+
+    if (tacticalBound)
+    {
+        bool tacticalBlock = s.config.tacticalBlockHandTrigger && s.menuState == 0;
+        if (tacticalBlock != o.blocked)
+            Log("%s trigger %s", HandName(s, s.tacticalHand), tacticalBlock ? "blocked (gameplay, tactical bound)" : "passes through");
+        o.blocked = tacticalBlock;
+    }
+    bool blocked = (tacticalBound && o.blocked) || reloadBlock || o.waitRelease;
 
     float output = std::max(s.tacticalButton.pressed ? 1.0f : 0.0f, rawActive && !blocked ? raw.currentState : 0.0f);
     o.changed = !o.applies || output != o.output;
@@ -706,7 +806,7 @@ void UpdateSprint(LayerState& s, XrSession session)
         sprint.stopStart = 0;
         sprint.stopEnd = 0;
     }
-    else if (sprint.lowered && measured && stopMethod && s.menuState == 0 && s.reloadHighlight == 0)
+    else if (sprint.lowered && measured && stopMethod && s.menuState == 0 && !s.reloadWaiting)
     {
         sprint.stopStart = s.frame + kSprintStopGapFrames;
         sprint.stopEnd = sprint.stopStart + static_cast<uint64_t>(std::max(s.config.sprintStopFrames, 1));
@@ -725,7 +825,7 @@ void UpdateSprint(LayerState& s, XrSession session)
         Log("gun %.0f cm below eyes, pitch %.0f degrees (%s hand)", belowEyes, s.gunPitch, HandName(s, s.gunHand));
     }
 
-    bool wanted = lowered && s.menuState == 0 && s.reloadHighlight == 0;
+    bool wanted = lowered && s.menuState == 0 && !s.reloadWaiting;
     bool pressed = false;
     if (s.config.sprintMode == "pulse")
     {
@@ -767,7 +867,7 @@ XrResult XRAPI_CALL HookDestroyInstance(XrInstance instance)
     std::lock_guard lock(s.mutex);
     s.squeeze = XR_NULL_HANDLE;
     s.trigger = XR_NULL_HANDLE;
-    s.toggleGrip = XR_NULL_HANDLE;
+    s.reloadGrab = XR_NULL_HANDLE;
     s.crouch = XR_NULL_HANDLE;
     s.tactical = XR_NULL_HANDLE;
     s.grips.clear();
@@ -804,12 +904,13 @@ XrResult XRAPI_CALL HookCreateActionSet(XrInstance instance, const XrActionSetCr
 
     XrAction tactical = s.config.tacticalEnabled ? CreateLayerAction(s, *actionSet, kTacticalActionName, kTacticalLocalizedName, {}) : XR_NULL_HANDLE;
     XrAction crouch = s.config.crouchEnabled ? CreateLayerAction(s, *actionSet, kCrouchActionName, kCrouchLocalizedName, {}) : XR_NULL_HANDLE;
-    XrAction toggleGrip = CreateLayerAction(s, *actionSet, kToggleGripActionName, kToggleGripLocalizedName, {s.leftHand, s.rightHand});
+    XrAction reloadGrab =
+        s.config.reloadGrabEnabled ? CreateLayerAction(s, *actionSet, kReloadGrabActionName, kReloadGrabLocalizedName, {s.leftHand, s.rightHand}) : XR_NULL_HANDLE;
 
     std::lock_guard lock(s.mutex);
     s.tactical = tactical;
     s.crouch = crouch;
-    s.toggleGrip = toggleGrip;
+    s.reloadGrab = reloadGrab;
     s.tacticalButton = {};
     s.crouchButton = {};
     return result;
@@ -914,49 +1015,28 @@ XrResult XRAPI_CALL HookLocateViews(XrSession session, const XrViewLocateInfo* v
 XrResult XRAPI_CALL HookSuggestInteractionProfileBindings(XrInstance instance, const XrInteractionProfileSuggestedBinding* suggested)
 {
     LayerState& s = State();
-    std::vector<XrActionSuggestedBinding> crouchExtras;
-    std::vector<XrActionSuggestedBinding> toggleExtras;
+    std::vector<XrActionSuggestedBinding> extras;
     XrPath profile = XR_NULL_PATH;
     {
         std::lock_guard lock(s.mutex);
         profile = s.indexProfile;
         if (s.crouch != XR_NULL_HANDLE && s.crouchBinding != XR_NULL_PATH)
-            crouchExtras.push_back({s.crouch, s.crouchBinding});
-        if (s.toggleGrip != XR_NULL_HANDLE && s.toggleBindingLeft != XR_NULL_PATH && s.toggleBindingRight != XR_NULL_PATH)
-        {
-            toggleExtras.push_back({s.toggleGrip, s.toggleBindingLeft});
-            toggleExtras.push_back({s.toggleGrip, s.toggleBindingRight});
-        }
+            extras.push_back({s.crouch, s.crouchBinding});
     }
 
-    if (!suggested || profile == XR_NULL_PATH || suggested->interactionProfile != profile || (crouchExtras.empty() && toggleExtras.empty()))
+    if (!suggested || profile == XR_NULL_PATH || suggested->interactionProfile != profile || extras.empty())
         return s.next.suggestInteractionProfileBindings(instance, suggested);
 
-    auto attempt = [&](bool withToggle, bool withCrouch, const char* label) {
-        std::vector<XrActionSuggestedBinding> bindings(suggested->suggestedBindings, suggested->suggestedBindings + suggested->countSuggestedBindings);
-        if (withToggle)
-            bindings.insert(bindings.end(), toggleExtras.begin(), toggleExtras.end());
-        if (withCrouch)
-            bindings.insert(bindings.end(), crouchExtras.begin(), crouchExtras.end());
-        XrInteractionProfileSuggestedBinding extended = *suggested;
-        extended.countSuggestedBindings = static_cast<uint32_t>(bindings.size());
-        extended.suggestedBindings = bindings.data();
-        XrResult result = s.next.suggestInteractionProfileBindings(instance, &extended);
-        Log("index bindings suggested %s (%u total): %d", label, extended.countSuggestedBindings, result);
-        return result;
-    };
-
-    XrResult result = attempt(!toggleExtras.empty(), !crouchExtras.empty(), "with all layer actions");
+    std::vector<XrActionSuggestedBinding> bindings(suggested->suggestedBindings, suggested->suggestedBindings + suggested->countSuggestedBindings);
+    bindings.insert(bindings.end(), extras.begin(), extras.end());
+    XrInteractionProfileSuggestedBinding extended = *suggested;
+    extended.countSuggestedBindings = static_cast<uint32_t>(bindings.size());
+    extended.suggestedBindings = bindings.data();
+    XrResult result = s.next.suggestInteractionProfileBindings(instance, &extended);
+    Log("index bindings suggested with crouch (%u total): %d", extended.countSuggestedBindings, result);
     if (XR_SUCCEEDED(result))
         return result;
-    if (!toggleExtras.empty() && !crouchExtras.empty())
-    {
-        Log("runtime rejected crouch binding %s, retrying with toggle grip only", s.config.crouchBinding.c_str());
-        result = attempt(true, false, "with toggle grip only");
-        if (XR_SUCCEEDED(result))
-            return result;
-    }
-    Log("runtime rejected the layer bindings, suggesting the original bindings only");
+    Log("runtime rejected crouch binding %s, suggesting the original bindings only", s.config.crouchBinding.c_str());
     return s.next.suggestInteractionProfileBindings(instance, suggested);
 }
 
@@ -980,8 +1060,9 @@ XrResult XRAPI_CALL HookSyncActions(XrSession session, const XrActionsSyncInfo* 
         UpdateReloadState(s);
         if (s.squeeze != XR_NULL_HANDLE)
         {
-            UpdateGrips(s, session);
+            UpdateSqueeze(s, session);
             UpdateGunHand(s);
+            UpdateGrenade(s);
         }
         UpdateCrouch(s, session, commands);
         UpdateCommandAction(s, session, s.tactical, s.tacticalButton, "tactical", s.config.tacticalPressCommand, s.config.tacticalReleaseCommand,
@@ -1029,7 +1110,7 @@ XrResult XRAPI_CALL HookGetActionStateFloat(XrSession session, const XrActionSta
     }
 
     GripSlot* grip = FindGrip(s, getInfo->subactionPath);
-    if (!grip || !grip->sampled || (!state->isActive && !grip->toggleActive))
+    if (!grip || !grip->sampled)
         return result;
     state->isActive = XR_TRUE;
     state->currentState = grip->output;
@@ -1202,8 +1283,6 @@ XrResult XRAPI_CALL LayerCreateApiLayerInstance(const XrInstanceCreateInfo* info
     s.rightHand = ToPath(s, "/user/hand/right");
     s.indexProfile = ToPath(s, kIndexProfile);
     s.crouchBinding = s.config.crouchBinding.empty() ? XR_NULL_PATH : ToPath(s, s.config.crouchBinding.c_str());
-    s.toggleBindingLeft = ToPath(s, kToggleGripBindingLeft);
-    s.toggleBindingRight = ToPath(s, kToggleGripBindingRight);
     s.tacticalHand = s.config.tacticalHand == "left" ? s.leftHand : s.config.tacticalHand == "right" ? s.rightHand : XR_NULL_PATH;
     PFN_xrVoidFunction locateSpaces = nullptr;
     if (XR_SUCCEEDED(s.next.getInstanceProcAddr(s.instance, "xrLocateSpaces", &locateSpaces)))

@@ -7,10 +7,8 @@ namespace tf2vr
 struct Config
 {
     std::wstring targetProcess = L"Titanfall2VRLauncher.exe";
-    bool toggleLeft = true;
-    bool toggleRight = true;
-    bool reloadGuard = true;
-    std::string lockMode = "toggle";
+    bool reloadGrabEnabled = true;
+    bool grenadeToggle = true;
     bool crouchEnabled = true;
     std::string crouchBinding;
     std::string crouchPressCommand = "+duck";
