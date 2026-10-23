@@ -410,7 +410,7 @@ void UpdateSqueeze(LayerState& s, XrSession session)
             grip.pressAt = now;
         grip.rawPressed = rawPressed;
 
-        bool routed = s.reloadGrab != XR_NULL_HANDLE && s.reloadWaiting && grip.path != s.gunHand && !grip.grenadeHeld;
+        bool routed = grip.grabBound && s.reloadWaiting && grip.path != s.gunHand && !grip.grenadeHeld;
         if (routed != grip.routed)
             Log("%s hand: %s", grip.name, routed ? "grip blocked, reload grab active" : "grip restored");
         grip.routed = routed;
