@@ -58,7 +58,6 @@ Config LoadConfig(const std::wstring& path)
     config.reloadGrabEnabled = ReadBool(path, L"reload_grab", L"enabled", config.reloadGrabEnabled);
     config.grenadeToggle = ReadBool(path, L"grenade", L"toggle", config.grenadeToggle);
     config.crouchEnabled = ReadBool(path, L"crouch", L"enabled", config.crouchEnabled);
-    config.crouchBinding = ReadNarrow(path, L"crouch", L"binding", config.crouchBinding);
     config.crouchPressCommand = ReadNarrow(path, L"crouch", L"press_command", config.crouchPressCommand);
     config.crouchReleaseCommand = ReadNarrow(path, L"crouch", L"release_command", config.crouchReleaseCommand);
     config.crouchMode = ReadNarrow(path, L"crouch", L"mode", config.crouchMode);

@@ -50,7 +50,6 @@ constexpr const char* kReloadGrabLocalizedName = "Reload Grab";
 constexpr std::chrono::milliseconds kGunGrabWindow{500};
 constexpr std::chrono::milliseconds kReloadEndGrace{200};
 constexpr std::chrono::milliseconds kGrenadeMinPress{150};
-constexpr const char* kIndexProfile = "/interaction_profiles/valve/index_controller";
 constexpr int kMaxLoggedQueries = 8;
 
 struct NextFunctions
@@ -61,7 +60,6 @@ struct NextFunctions
     PFN_xrPathToString pathToString = nullptr;
     PFN_xrCreateActionSet createActionSet = nullptr;
     PFN_xrCreateAction createAction = nullptr;
-    PFN_xrSuggestInteractionProfileBindings suggestInteractionProfileBindings = nullptr;
     PFN_xrSyncActions syncActions = nullptr;
     PFN_xrGetActionStateFloat getActionStateFloat = nullptr;
     PFN_xrGetActionStateBoolean getActionStateBoolean = nullptr;
@@ -154,8 +152,6 @@ struct LayerState
     XrInstance instance = XR_NULL_HANDLE;
     XrPath leftHand = XR_NULL_PATH;
     XrPath rightHand = XR_NULL_PATH;
-    XrPath indexProfile = XR_NULL_PATH;
-    XrPath crouchBinding = XR_NULL_PATH;
     XrPath tacticalHand = XR_NULL_PATH;
     XrAction squeeze = XR_NULL_HANDLE;
     XrAction aim = XR_NULL_HANDLE;
@@ -261,8 +257,8 @@ void InitializeOnce()
         LogOpen(s.directory + L"\\" + kLogFileName);
         Log("layer active in %s", NarrowPath(process).c_str());
         Log("config: reload_grab=%d grenade_toggle=%d", s.config.reloadGrabEnabled, s.config.grenadeToggle);
-        Log("config: crouch=%d binding=%s press_cmd='%s' release_cmd='%s'", s.config.crouchEnabled, s.config.crouchBinding.c_str(),
-            s.config.crouchPressCommand.c_str(), s.config.crouchReleaseCommand.c_str());
+        Log("config: crouch=%d press_cmd='%s' release_cmd='%s'", s.config.crouchEnabled, s.config.crouchPressCommand.c_str(),
+            s.config.crouchReleaseCommand.c_str());
         Log("config: crouch mode=%s uncrouch_on_jump=%d jump_delay_ms=%d", s.config.crouchMode.c_str(), s.config.crouchUncrouchOnJump,
             s.config.crouchJumpDelayMs);
         Log("config: tactical=%d hand=%s block_in_game=%d press_cmd='%s' release_cmd='%s'", s.config.tacticalEnabled, s.config.tacticalHand.c_str(),
@@ -1012,34 +1008,6 @@ XrResult XRAPI_CALL HookLocateViews(XrSession session, const XrViewLocateInfo* v
     return result;
 }
 
-XrResult XRAPI_CALL HookSuggestInteractionProfileBindings(XrInstance instance, const XrInteractionProfileSuggestedBinding* suggested)
-{
-    LayerState& s = State();
-    std::vector<XrActionSuggestedBinding> extras;
-    XrPath profile = XR_NULL_PATH;
-    {
-        std::lock_guard lock(s.mutex);
-        profile = s.indexProfile;
-        if (s.crouch != XR_NULL_HANDLE && s.crouchBinding != XR_NULL_PATH)
-            extras.push_back({s.crouch, s.crouchBinding});
-    }
-
-    if (!suggested || profile == XR_NULL_PATH || suggested->interactionProfile != profile || extras.empty())
-        return s.next.suggestInteractionProfileBindings(instance, suggested);
-
-    std::vector<XrActionSuggestedBinding> bindings(suggested->suggestedBindings, suggested->suggestedBindings + suggested->countSuggestedBindings);
-    bindings.insert(bindings.end(), extras.begin(), extras.end());
-    XrInteractionProfileSuggestedBinding extended = *suggested;
-    extended.countSuggestedBindings = static_cast<uint32_t>(bindings.size());
-    extended.suggestedBindings = bindings.data();
-    XrResult result = s.next.suggestInteractionProfileBindings(instance, &extended);
-    Log("index bindings suggested with crouch (%u total): %d", extended.countSuggestedBindings, result);
-    if (XR_SUCCEEDED(result))
-        return result;
-    Log("runtime rejected crouch binding %s, suggesting the original bindings only", s.config.crouchBinding.c_str());
-    return s.next.suggestInteractionProfileBindings(instance, suggested);
-}
-
 XrResult XRAPI_CALL HookSyncActions(XrSession session, const XrActionsSyncInfo* syncInfo)
 {
     LayerState& s = State();
@@ -1193,7 +1161,6 @@ const Hook kHooks[] = {
     {"xrDestroyInstance", reinterpret_cast<PFN_xrVoidFunction>(&HookDestroyInstance)},
     {"xrCreateActionSet", reinterpret_cast<PFN_xrVoidFunction>(&HookCreateActionSet)},
     {"xrCreateAction", reinterpret_cast<PFN_xrVoidFunction>(&HookCreateAction)},
-    {"xrSuggestInteractionProfileBindings", reinterpret_cast<PFN_xrVoidFunction>(&HookSuggestInteractionProfileBindings)},
     {"xrSyncActions", reinterpret_cast<PFN_xrVoidFunction>(&HookSyncActions)},
     {"xrGetActionStateFloat", reinterpret_cast<PFN_xrVoidFunction>(&HookGetActionStateFloat)},
     {"xrGetActionStateBoolean", reinterpret_cast<PFN_xrVoidFunction>(&HookGetActionStateBoolean)},
@@ -1263,7 +1230,6 @@ XrResult XRAPI_CALL LayerCreateApiLayerInstance(const XrInstanceCreateInfo* info
                     ResolveNext(s, "xrPathToString", s.next.pathToString) &&
                     ResolveNext(s, "xrCreateActionSet", s.next.createActionSet) &&
                     ResolveNext(s, "xrCreateAction", s.next.createAction) &&
-                    ResolveNext(s, "xrSuggestInteractionProfileBindings", s.next.suggestInteractionProfileBindings) &&
                     ResolveNext(s, "xrSyncActions", s.next.syncActions) &&
                     ResolveNext(s, "xrGetActionStateFloat", s.next.getActionStateFloat) &&
                     ResolveNext(s, "xrGetActionStateBoolean", s.next.getActionStateBoolean) &&
@@ -1281,8 +1247,6 @@ XrResult XRAPI_CALL LayerCreateApiLayerInstance(const XrInstanceCreateInfo* info
 
     s.leftHand = ToPath(s, "/user/hand/left");
     s.rightHand = ToPath(s, "/user/hand/right");
-    s.indexProfile = ToPath(s, kIndexProfile);
-    s.crouchBinding = s.config.crouchBinding.empty() ? XR_NULL_PATH : ToPath(s, s.config.crouchBinding.c_str());
     s.tacticalHand = s.config.tacticalHand == "left" ? s.leftHand : s.config.tacticalHand == "right" ? s.rightHand : XR_NULL_PATH;
     PFN_xrVoidFunction locateSpaces = nullptr;
     if (XR_SUCCEEDED(s.next.getInstanceProcAddr(s.instance, "xrLocateSpaces", &locateSpaces)))

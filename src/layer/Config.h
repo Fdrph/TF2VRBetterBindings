@@ -10,7 +10,6 @@ struct Config
     bool reloadGrabEnabled = true;
     bool grenadeToggle = false;
     bool crouchEnabled = true;
-    std::string crouchBinding;
     std::string crouchPressCommand = "+duck";
     std::string crouchReleaseCommand = "-duck";
     std::string crouchMode = "toggle";
