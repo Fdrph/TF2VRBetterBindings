@@ -11,8 +11,18 @@ Bind them in SteamVR → Settings → Controllers → **Manage Controller Bindin
 | **Reload Grab** | Grab magazines and rack slides with the trigger. While you reload, Grip on that hand grabs nothing, so Grip only holds the gun | Each **Trigger**, *Use as Button*, next to the mod's own trigger |
 | **Crouch** | Crouch | Any button: *Use as Button* to hold, *Use as Toggle Button* to toggle |
 | **Tactical Ability** | Cloak. The trigger of the hand without the gun then stops cloaking | Any button |
+| **Next Weapon** | Puts the gun in your hand away and draws your next gun (primary → secondary → arc tool) | Any button |
+| **Draw Primary Weapon** / **Draw Secondary Weapon** | Draws that gun | Any button |
 
 Tip: set the mod's **VR Settings → Gun Grip** to **Toggle** to hold your gun with one press of Grip.
+
+### Holster learning and bigger holsters
+
+Every time you draw a gun or take a grenade by hand, the add-on remembers where your hand was, relative to your head, and saves it to `TF2VRBetterBindings.holsters.ini` next to the layer. The weapon buttons use these positions: they briefly move your hand into the holster and squeeze grip for you, so **draw each gun once by hand (with each hand you use) before the buttons work**. Until then the buttons fall back to a console command, which may switch the gun without putting it in your hand.
+
+With `[holsters] assist=1`, a grip press within `assist_radius_cm` (default 15) of a learned holster grabs from that holster, so the holsters act bigger. It never applies to the hand holding a gun, while reloading, or while you point at a pickup.
+
+Keep `TF2VRBetterBindings.holsters.ini` when you update the add-on.
 
 > [!IMPORTANT]
 > **Optional features.** Turn them on in `TF2VR\packages\Nighteyes-TF2VRBetterBindings-<version>\plugins\layer\TF2VRBetterBindings.ini`, then restart the game.
