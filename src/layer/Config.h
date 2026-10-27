@@ -33,6 +33,7 @@ struct Config
     int weaponSwitchMoveFrames = 3;
     int weaponSwitchGrabFrames = 4;
     int weaponSwitchTimeoutMs = 750;
+    std::string weaponSwitchCycle = "primary,secondary,arc_tool,empty";
     bool holsterLearn = true;
     bool holsterAssist = true;
     int holsterAssistRadiusCm = 15;

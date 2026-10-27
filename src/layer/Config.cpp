@@ -81,6 +81,7 @@ Config LoadConfig(const std::wstring& path)
     config.weaponSwitchMoveFrames = ReadInt(path, L"weapon_switch", L"move_frames", config.weaponSwitchMoveFrames);
     config.weaponSwitchGrabFrames = ReadInt(path, L"weapon_switch", L"grab_frames", config.weaponSwitchGrabFrames);
     config.weaponSwitchTimeoutMs = ReadInt(path, L"weapon_switch", L"timeout_ms", config.weaponSwitchTimeoutMs);
+    config.weaponSwitchCycle = ReadNarrow(path, L"weapon_switch", L"cycle", config.weaponSwitchCycle);
     config.holsterLearn = ReadBool(path, L"holsters", L"learn", config.holsterLearn);
     config.holsterAssist = ReadBool(path, L"holsters", L"assist", config.holsterAssist);
     config.holsterAssistRadiusCm = ReadInt(path, L"holsters", L"assist_radius_cm", config.holsterAssistRadiusCm);

@@ -9,6 +9,7 @@
 #include <openxr/openxr_loader_negotiation.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -74,6 +75,8 @@ constexpr int kTogglePulseFrames = 3;
 constexpr int kCommandTicketBase = 1000000;
 // tf2vrbb_active_slot before the companion client script runs
 constexpr int kActiveSlotUnknown = -2;
+// switch target that only holsters the gun in hand
+constexpr int kEmptyHandsSlot = -3;
 
 struct NextFunctions
 {
@@ -335,6 +338,7 @@ struct LayerState
     int activeSlot = kActiveSlotUnknown;
     int pickup[2] = {-1, -1};
     WeaponSwitch weaponSwitch;
+    std::vector<int> weaponCycle;
     int commandTicket = kCommandTicketBase;
     bool loggedSpoofBase = false;
     uint64_t frame = 0;
@@ -458,9 +462,32 @@ void InitializeOnce()
         Log("config: sprint=%d hand=%s start_below_eyes_cm=%d stop_below_eyes_cm=%d mode=%s stop_method=%s stop_frames=%d", s.config.sprintEnabled,
             s.config.sprintHand.c_str(), s.config.sprintStartBelowEyesCm, s.config.sprintStopBelowEyesCm, s.config.sprintMode.c_str(),
             s.config.sprintStopMethod.c_str(), s.config.sprintStopFrames);
-        Log("config: weapon_switch=%d method=%s release_frames=%d move_frames=%d grab_frames=%d timeout_ms=%d", s.config.weaponSwitchEnabled,
-            s.config.weaponSwitchMethod.c_str(), s.config.weaponSwitchReleaseFrames, s.config.weaponSwitchMoveFrames, s.config.weaponSwitchGrabFrames,
-            s.config.weaponSwitchTimeoutMs);
+        Log("config: weapon_switch=%d method=%s release_frames=%d move_frames=%d grab_frames=%d timeout_ms=%d cycle=%s",
+            s.config.weaponSwitchEnabled, s.config.weaponSwitchMethod.c_str(), s.config.weaponSwitchReleaseFrames, s.config.weaponSwitchMoveFrames,
+            s.config.weaponSwitchGrabFrames, s.config.weaponSwitchTimeoutMs, s.config.weaponSwitchCycle.c_str());
+        for (size_t begin = 0; begin <= s.config.weaponSwitchCycle.size();)
+        {
+            size_t comma = s.config.weaponSwitchCycle.find(',', begin);
+            if (comma == std::string::npos)
+                comma = s.config.weaponSwitchCycle.size();
+            std::string name;
+            for (char c : s.config.weaponSwitchCycle.substr(begin, comma - begin))
+                if (c != ' ' && c != '	')
+                    name += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            begin = comma + 1;
+            int slot = name == "empty" ? kEmptyHandsSlot : -1;
+            for (int i = 0; i < kHolsterCount; ++i)
+                if (name == kHolsterNames[i])
+                    slot = kHolsterSlots[i];
+            if (slot == -1)
+            {
+                if (!name.empty())
+                    Log("config: unknown weapon_switch cycle entry '%s' ignored", name.c_str());
+                continue;
+            }
+            if (std::find(s.weaponCycle.begin(), s.weaponCycle.end(), slot) == s.weaponCycle.end())
+                s.weaponCycle.push_back(slot);
+        }
         Log("config: holsters learn=%d assist=%d assist_radius_cm=%d", s.config.holsterLearn, s.config.holsterAssist, s.config.holsterAssistRadiusCm);
         s.holsterPath = s.directory + L"\\" + kHolsterFileName;
         LoadHolsters(s);
@@ -573,6 +600,8 @@ int HolsterIndex(int slot)
 
 const char* HolsterName(int slot)
 {
+    if (slot == kEmptyHandsSlot)
+        return "empty hands";
     int index = HolsterIndex(slot);
     return index < 0 ? "unknown" : kHolsterNames[index];
 }
@@ -690,6 +719,15 @@ void AdvanceWeaponSwitch(LayerState& s)
             if (s.activeSlot == -1 || (s.activeSlot == kActiveSlotUnknown && w.frame >= release))
             {
                 Log("switch: current gun holstered after %d frames", w.frame);
+                if (w.slot == kEmptyHandsSlot)
+                {
+                    // Hold grip: a grip still squeezed stays released until you let go, so it can't grab anything
+                    GripSlot* grip = FindGrip(s, w.hand);
+                    if (!w.toggle && grip && grip->rawPressed)
+                        grip->waitRelease = true;
+                    EndSwitch(s, "done");
+                    return;
+                }
                 w.phase = SwitchPhase::Move;
                 w.frame = 0;
                 continue;
@@ -760,7 +798,7 @@ void BeginGrab(LayerState& s, bool assist, XrPath hand, int slot, Vec3 target, b
     w.hand = hand;
     w.slot = slot;
     w.target = target;
-    w.phase = holding ? SwitchPhase::Release : SwitchPhase::Move;
+    w.phase = holding || slot == kEmptyHandsSlot ? SwitchPhase::Release : SwitchPhase::Move;
     w.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(s.config.weaponSwitchTimeoutMs, 1));
     w.startGunAck = s.gunAck;
     w.startGrenadeAck = s.grenadeAck;
@@ -768,19 +806,24 @@ void BeginGrab(LayerState& s, bool assist, XrPath hand, int slot, Vec3 target, b
         grip.forceHeld = false;
 }
 
+// the next entry of [weapon_switch] cycle after what's in hand, skipping guns you don't carry and grenades you don't have
 int NextGunSlot(const LayerState& s)
 {
-    int current = s.activeSlot >= 0 ? s.activeSlot : -1;
-    if (current < 0 && s.gunSlot >= 0 && Owned(s, s.gunSlot))
-        return s.gunSlot;
-    int position = 2;
-    for (int i = 0; i < 3; ++i)
-        if (kGunSlots[i] == current)
+    const std::vector<int>& cycle = s.weaponCycle;
+    int current = s.activeSlot >= 0 ? s.activeSlot : kEmptyHandsSlot;
+    int count = static_cast<int>(cycle.size());
+    int position = -1;
+    for (int i = 0; i < count; ++i)
+        if (cycle[i] == current)
             position = i;
-    for (int step = 1; step <= 3; ++step)
+    if (position < 0 && current == kEmptyHandsSlot && s.gunSlot >= 0 && Owned(s, s.gunSlot))
+        return s.gunSlot;
+    for (int step = 1; step <= count; ++step)
     {
-        int slot = kGunSlots[(position + step) % 3];
-        if (Owned(s, slot) && slot != current)
+        int slot = cycle[(position + step + count) % count];
+        if (slot == current)
+            continue;
+        if (slot == kEmptyHandsSlot ? s.activeSlot >= 0 : Owned(s, slot))
             return slot;
     }
     return -1;
@@ -788,6 +831,12 @@ int NextGunSlot(const LayerState& s)
 
 void StartWeaponSwitch(LayerState& s, int slot, std::vector<std::string>& commands)
 {
+    if (slot == kEmptyHandsSlot)
+    {
+        BeginGrab(s, false, s.gunHand, slot, {}, true);
+        Log("switch to empty hands: holstering the gun in the %s hand (%s grip)", HandName(s, s.gunHand), s.weaponSwitch.toggle ? "toggle" : "hold");
+        return;
+    }
     int hand = HandIndex(s, s.gunHand);
     int index = HolsterIndex(slot);
     const Holster* holster = hand >= 0 && index >= 0 ? &s.holsters[index][hand] : nullptr;
@@ -827,8 +876,9 @@ void UpdateWeaponButtons(LayerState& s, XrSession session, std::vector<std::stri
 
     const char* blocked = s.menuState != 0 ? "menu open" : s.weaponSwitch.phase != SwitchPhase::Idle ? "a switch is already running"
                         : s.reloadWaiting                                         ? "reloading"
-                        : slot < 0                                                ? "no other gun to switch to"
-                        : !Owned(s, slot)                                         ? "you don't carry that gun"
+                        : slot == -1                                              ? "no other gun to switch to"
+                        : slot == kEmptyHandsSlot && s.activeSlot == -1           ? "hands already empty"
+                        : slot >= 0 && !Owned(s, slot)                            ? "you don't carry that"
                         : slot == s.activeSlot                                    ? "already in hand"
                                                                                   : nullptr;
     if (blocked)

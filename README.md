@@ -11,7 +11,7 @@ Bind them in SteamVR → Settings → Controllers → **Manage Controller Bindin
 | **Reload Grab** | Grab magazines and rack slides with the trigger. While you reload, Grip on that hand grabs nothing, so Grip only holds the gun | Each **Trigger**, *Use as Button*, next to the mod's own trigger |
 | **Crouch** | Crouch | Any button: *Use as Button* to hold, *Use as Toggle Button* to toggle |
 | **Tactical Ability** | Cloak. The trigger of the hand without the gun then stops cloaking | Any button |
-| **Next Weapon** | Puts the gun in your hand away and draws your next gun (primary → secondary → arc tool) | Any button |
+| **Next Weapon** | Steps through primary → secondary → arc tool → empty hands, skipping what you don't carry. Change the order with `[weapon_switch] cycle` | Any button |
 | **Draw Primary Weapon** / **Draw Secondary Weapon** | Draws that gun | Any button |
 
 Tip: set the mod's **VR Settings → Gun Grip** to **Toggle** to hold your gun with one press of Grip.
@@ -44,6 +44,7 @@ Keep `TF2VRBetterBindings.holsters.ini` when you update the add-on.
 | `[sprint] start_below_eyes_cm` | `30` | How far below your eyes the gun must be to sprint |
 | `[sprint] stop_below_eyes_cm` | `20` | How close to your eyes the gun must come to stop |
 | `[reload_grab] enabled` | `1` | `0` = remove the **Reload Grab** action |
+| `[weapon_switch] cycle` | `primary,secondary,arc_tool,empty` | What **Next Weapon** steps through, in order. Any of `primary`, `secondary`, `arc_tool`, `grenade`, `empty` (holster the gun) |
 
 </details>
 
