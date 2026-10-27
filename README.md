@@ -24,6 +24,10 @@ With `[holsters] assist=1`, a grip press within `assist_radius_cm` (default 15) 
 
 Keep `TF2VRBetterBindings.holsters.ini` when you update the add-on.
 
+### PS VR2 adaptive triggers
+
+With PS VR2 Sense controllers and [PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit) installed, the trigger of the hand holding the gun pushes back differently for pistols, automatics, marksman rifles, shotguns, launchers, the arc tool and Titan weapons, buzzes while automatics fire, and goes loose on an empty magazine. It is off in menus and during reloads. Tune or turn it off in `[triggers]` of the `.ini`. Without PSVR2Toolkit nothing happens.
+
 > [!IMPORTANT]
 > **Optional features.** Turn them on in `TF2VR\packages\Nighteyes-TF2VRBetterBindings-<version>\plugins\layer\TF2VRBetterBindings.ini`, then restart the game.
 >

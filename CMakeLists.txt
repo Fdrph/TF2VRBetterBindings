@@ -28,7 +28,8 @@ set(LAYER_SOURCES
     src/layer/Engine.cpp
     src/layer/GameVar.cpp
     src/layer/Config.cpp
-    src/layer/Log.cpp)
+    src/layer/Log.cpp
+    src/layer/TriggerHaptics.cpp)
 
 add_library(tf2vrbb_layer SHARED ${LAYER_SOURCES})
 set_target_properties(tf2vrbb_layer PROPERTIES OUTPUT_NAME TF2VRBetterBindingsLayer)

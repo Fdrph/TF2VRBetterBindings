@@ -85,6 +85,16 @@ Config LoadConfig(const std::wstring& path)
     config.holsterLearn = ReadBool(path, L"holsters", L"learn", config.holsterLearn);
     config.holsterAssist = ReadBool(path, L"holsters", L"assist", config.holsterAssist);
     config.holsterAssistRadiusCm = ReadInt(path, L"holsters", L"assist_radius_cm", config.holsterAssistRadiusCm);
+    config.triggersEnabled = ReadBool(path, L"triggers", L"enabled", config.triggersEnabled);
+    config.triggersCapiPath = ReadString(path, L"triggers", L"capi_path", config.triggersCapiPath);
+    for (int kind = 0; kind < kTriggerKindCount; ++kind)
+    {
+        std::wstring name = Widen(kTriggerKindNames[kind]);
+        config.triggerProfiles[kind] = ReadNarrow(path, L"triggers", name.c_str(), config.triggerProfiles[kind]);
+        config.triggerFiring[kind] = ReadNarrow(path, L"triggers", (name + L"_firing").c_str(), config.triggerFiring[kind]);
+    }
+    config.triggerEmpty = ReadNarrow(path, L"triggers", L"empty_magazine", config.triggerEmpty);
+    config.triggerFiringMs = ReadInt(path, L"triggers", L"firing_ms", config.triggerFiringMs);
     return config;
 }
 }

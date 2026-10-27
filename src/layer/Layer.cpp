@@ -2,6 +2,7 @@
 #include "Engine.h"
 #include "GameVar.h"
 #include "Log.h"
+#include "TriggerHaptics.h"
 
 #include <windows.h>
 
@@ -55,6 +56,8 @@ constexpr int kMaxLoggedQueries = 8;
 constexpr const char* kHolsterMaskVar = "tf2vr_holster_mask";
 constexpr const char* kGunSlotVar = "tf2vr_gun_slot";
 constexpr const char* kActiveSlotVar = "tf2vrbb_active_slot";
+constexpr const char* kTriggerKindVar = "tf2vrbb_trigger_kind";
+constexpr const char* kClipVar = "tf2vrbb_clip";
 constexpr const char* kPickupLeftVar = "tf2vr_pickup_left";
 constexpr const char* kPickupRightVar = "tf2vr_pickup_right";
 constexpr const wchar_t* kHolsterFileName = L"TF2VRBetterBindings.holsters.ini";
@@ -339,6 +342,15 @@ struct LayerState
     int pickup[2] = {-1, -1};
     WeaponSwitch weaponSwitch;
     std::vector<int> weaponCycle;
+    GameVar triggerKindVar{kTriggerKindVar};
+    GameVar clipVar{kClipVar};
+    TriggerEffect triggerProfiles[kTriggerKindCount];
+    TriggerEffect triggerFiring[kTriggerKindCount];
+    bool triggerHasFiring[kTriggerKindCount] = {};
+    TriggerEffect triggerEmpty;
+    int triggerKind = 0;
+    int clip = -1;
+    std::chrono::steady_clock::time_point firingUntil;
     int commandTicket = kCommandTicketBase;
     bool loggedSpoofBase = false;
     uint64_t frame = 0;
@@ -488,6 +500,22 @@ void InitializeOnce()
             if (std::find(s.weaponCycle.begin(), s.weaponCycle.end(), slot) == s.weaponCycle.end())
                 s.weaponCycle.push_back(slot);
         }
+        Log("config: triggers=%d capi_path='%ls' firing_ms=%d", s.config.triggersEnabled, s.config.triggersCapiPath.c_str(), s.config.triggerFiringMs);
+        auto parseTrigger = [](const char* key, const std::string& text, TriggerEffect& effect) {
+            if (!ParseTriggerEffect(text, effect))
+                Log("config: triggers %s='%s' is not a trigger effect, using off", key, text.c_str());
+        };
+        for (int kind = 0; kind < kTriggerKindCount; ++kind)
+        {
+            std::string firingKey = std::string(kTriggerKindNames[kind]) + "_firing";
+            parseTrigger(kTriggerKindNames[kind], s.config.triggerProfiles[kind], s.triggerProfiles[kind]);
+            s.triggerHasFiring[kind] = !s.config.triggerFiring[kind].empty();
+            if (s.triggerHasFiring[kind])
+                parseTrigger(firingKey.c_str(), s.config.triggerFiring[kind], s.triggerFiring[kind]);
+        }
+        parseTrigger("empty_magazine", s.config.triggerEmpty, s.triggerEmpty);
+        if (s.config.triggersEnabled)
+            triggers::Start(s.config.triggersCapiPath);
         Log("config: holsters learn=%d assist=%d assist_radius_cm=%d", s.config.holsterLearn, s.config.holsterAssist, s.config.holsterAssistRadiusCm);
         s.holsterPath = s.directory + L"\\" + kHolsterFileName;
         LoadHolsters(s);
@@ -855,6 +883,34 @@ void StartWeaponSwitch(LayerState& s, int slot, std::vector<std::string>& comman
     BeginGrab(s, false, s.gunHand, slot, holster->local, holding);
     Log("switch to %s with the %s hand (%s grip)%s", HolsterName(slot), HandName(s, s.gunHand), s.weaponSwitch.toggle ? "toggle" : "hold",
         holding ? ", holstering the current gun first" : "");
+}
+
+// adaptive trigger of the gun hand: a profile per kind of gun, another while firing, loose on an empty magazine
+void UpdateTriggers(LayerState& s)
+{
+    if (!s.config.triggersEnabled)
+        return;
+    int value = 0;
+    int kind = s.triggerKindVar.ReadInt(value) && value >= 0 && value < kTriggerKindCount ? value : 0;
+    int clip = s.clipVar.ReadInt(value) ? value : -1;
+    auto now = std::chrono::steady_clock::now();
+    if (kind != s.triggerKind)
+        Log("trigger kind %d (%s)", kind, kTriggerKindNames[kind]);
+    else if (clip >= 0 && s.clip >= 0 && clip < s.clip)
+        s.firingUntil = now + std::chrono::milliseconds(std::max(s.config.triggerFiringMs, 0));
+    s.triggerKind = kind;
+    s.clip = clip;
+
+    TriggerEffect effect = s.triggerProfiles[kind];
+    if (s.menuState != 0 || s.reloadWaiting)
+        effect = {};
+    else if (kind != 0 && clip == 0)
+        effect = s.triggerEmpty;
+    else if (s.triggerHasFiring[kind] && now < s.firingUntil)
+        effect = s.triggerFiring[kind];
+    int gun = HandIndex(s, s.gunHand);
+    for (int hand = 0; hand < 2; ++hand)
+        triggers::SetTrigger(hand, hand == gun ? effect : TriggerEffect{});
 }
 
 void UpdateWeaponButtons(LayerState& s, XrSession session, std::vector<std::string>& commands)
@@ -1505,6 +1561,10 @@ XrResult XRAPI_CALL HookDestroyInstance(XrInstance instance)
     LayerState& s = State();
     XrResult result = s.next.destroyInstance(instance);
     std::lock_guard lock(s.mutex);
+    for (int hand = 0; hand < 2; ++hand)
+        triggers::SetTrigger(hand, {});
+    s.triggerKind = 0;
+    s.clip = -1;
     s.squeeze = XR_NULL_HANDLE;
     s.trigger = XR_NULL_HANDLE;
     s.reloadGrab = XR_NULL_HANDLE;
@@ -1709,6 +1769,7 @@ XrResult XRAPI_CALL HookSyncActions(XrSession session, const XrActionsSyncInfo* 
         UpdateMenuState(s);
         UpdateReloadState(s);
         UpdateGameVars(s);
+        UpdateTriggers(s);
         UpdateWeaponButtons(s, session, commands);
         AdvanceWeaponSwitch(s);
         if (s.squeeze != XR_NULL_HANDLE)
