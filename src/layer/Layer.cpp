@@ -51,6 +51,29 @@ constexpr std::chrono::milliseconds kGunGrabWindow{500};
 constexpr std::chrono::milliseconds kReloadEndGrace{200};
 constexpr std::chrono::milliseconds kGrenadeMinPress{150};
 constexpr int kMaxLoggedQueries = 8;
+constexpr const char* kHolsterMaskVar = "tf2vr_holster_mask";
+constexpr const char* kGunSlotVar = "tf2vr_gun_slot";
+constexpr const char* kActiveSlotVar = "tf2vrbb_active_slot";
+constexpr const char* kPickupLeftVar = "tf2vr_pickup_left";
+constexpr const char* kPickupRightVar = "tf2vr_pickup_right";
+constexpr const wchar_t* kHolsterFileName = L"TF2VRBetterBindings.holsters.ini";
+constexpr const char* kNextWeaponActionName = "tf2vr_next_weapon";
+constexpr const char* kNextWeaponLocalizedName = "Next Weapon";
+constexpr const char* kDrawPrimaryActionName = "tf2vr_draw_primary";
+constexpr const char* kDrawPrimaryLocalizedName = "Draw Primary Weapon";
+constexpr const char* kDrawSecondaryActionName = "tf2vr_draw_secondary";
+constexpr const char* kDrawSecondaryLocalizedName = "Draw Secondary Weapon";
+// holster bits in tf2vr_holster_mask: gun slots 0, 1, 3 (arc tool) and 4 while a grenade is ready
+constexpr int kGrenadeSlot = 4;
+constexpr int kHolsterSlots[] = {0, 1, 3, kGrenadeSlot};
+constexpr const char* kHolsterNames[] = {"primary", "secondary", "arc_tool", "grenade"};
+constexpr int kHolsterCount = 4;
+constexpr int kGunSlots[] = {0, 1, 3};
+constexpr float kHolsterLearnRate = 0.3f;
+constexpr int kTogglePulseFrames = 3;
+constexpr int kCommandTicketBase = 1000000;
+// tf2vrbb_active_slot before the companion client script runs
+constexpr int kActiveSlotUnknown = -2;
 
 struct NextFunctions
 {
@@ -71,10 +94,94 @@ struct NextFunctions
     PFN_xrLocateViews locateViews = nullptr;
 };
 
+struct Vec3
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+Vec3 operator+(Vec3 a, Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+Vec3 operator-(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+Vec3 operator*(Vec3 a, float k) { return {a.x * k, a.y * k, a.z * k}; }
+float Dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 Cross(Vec3 a, Vec3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+float Length(Vec3 a) { return std::sqrt(Dot(a, a)); }
+Vec3 FromXr(const XrVector3f& v) { return {v.x, v.y, v.z}; }
+
+Vec3 Rotate(const XrQuaternionf& q, Vec3 v)
+{
+    Vec3 u{q.x, q.y, q.z};
+    Vec3 t = Cross(u, v) * 2.0f;
+    return v + t * q.w + Cross(u, t);
+}
+
 struct AimSpace
 {
     XrSpace space = XR_NULL_HANDLE;
     XrPath hand = XR_NULL_PATH;
+};
+
+// any pose action space of a hand; all of them move together while a grab is faked
+struct HandSpace
+{
+    XrSpace space = XR_NULL_HANDLE;
+    XrPath hand = XR_NULL_PATH;
+};
+
+struct HandPose
+{
+    bool valid = false;
+    Vec3 position;
+    XrSpace base = XR_NULL_HANDLE;
+    XrTime time = 0;
+};
+
+// eye midpoint with the head's heading flattened onto the floor; holsters are stored in this frame
+struct HeadFrame
+{
+    bool valid = false;
+    Vec3 position;
+    Vec3 forward{0.0f, 0.0f, -1.0f};
+    Vec3 right{1.0f, 0.0f, 0.0f};
+    XrSpace base = XR_NULL_HANDLE;
+    XrTime time = 0;
+};
+
+// right, up and forward of the head, in meters
+struct Holster
+{
+    bool learned = false;
+    Vec3 local;
+    int samples = 0;
+};
+
+enum class SwitchPhase
+{
+    Idle,
+    Release,
+    WaitEmpty,
+    Move,
+    Grab,
+    Confirm,
+};
+
+// a faked grab: optionally let go of the current gun, move the hand to a holster, squeeze there
+struct WeaponSwitch
+{
+    SwitchPhase phase = SwitchPhase::Idle;
+    bool assist = false;
+    bool toggle = false;
+    XrPath hand = XR_NULL_PATH;
+    int slot = -1;
+    Vec3 target;
+    int frame = 0;
+    std::chrono::steady_clock::time_point deadline;
+    int startGunAck = 0;
+    int startGrenadeAck = 0;
+    float squeeze = -1.0f;
+    bool spoof = false;
+    bool loggedSpoof = false;
 };
 
 struct SprintState
@@ -107,6 +214,11 @@ struct GripSlot
     std::chrono::steady_clock::time_point pressAt;
     bool grenadeHeld = false;
     bool waitRelease = false;
+    bool forceHeld = false;
+    bool pressValid = false;
+    Vec3 pressLocal;
+    bool pressPickup = false;
+    bool pressSynthetic = false;
 };
 
 struct ButtonState
@@ -201,6 +313,30 @@ struct LayerState
     int grenadeAck = 0;
     bool grenadeToggleActive = false;
     XrPath gunHand = XR_NULL_PATH;
+    std::vector<XrAction> poseActions;
+    std::vector<HandSpace> handSpaces;
+    HandPose hands[2];
+    HeadFrame head;
+    std::wstring holsterPath;
+    Holster holsters[kHolsterCount][2];
+    XrAction nextWeapon = XR_NULL_HANDLE;
+    XrAction drawPrimary = XR_NULL_HANDLE;
+    XrAction drawSecondary = XR_NULL_HANDLE;
+    ButtonState nextWeaponButton;
+    ButtonState drawPrimaryButton;
+    ButtonState drawSecondaryButton;
+    GameVar holsterMaskVar{kHolsterMaskVar};
+    GameVar gunSlotVar{kGunSlotVar};
+    GameVar activeSlotVar{kActiveSlotVar};
+    GameVar pickupLeftVar{kPickupLeftVar};
+    GameVar pickupRightVar{kPickupRightVar};
+    int holsterMask = 0;
+    int gunSlot = -1;
+    int activeSlot = kActiveSlotUnknown;
+    int pickup[2] = {-1, -1};
+    WeaponSwitch weaponSwitch;
+    int commandTicket = kCommandTicketBase;
+    bool loggedSpoofBase = false;
     uint64_t frame = 0;
     int loggedSqueezeQueries = 0;
     int loggedBooleanQueries = 0;
@@ -242,6 +378,62 @@ std::string NarrowPath(const std::wstring& text)
     return result;
 }
 
+std::wstring WidenAscii(const char* text)
+{
+    std::wstring result;
+    for (; *text; ++text)
+        result += static_cast<wchar_t>(*text);
+    return result;
+}
+
+const char* kHandNames[] = {"left", "right"};
+
+std::wstring HolsterSection(int index, int hand)
+{
+    return L"holster_" + WidenAscii(kHolsterNames[index]) + L"_" + WidenAscii(kHandNames[hand]);
+}
+
+void LoadHolsters(LayerState& s)
+{
+    const wchar_t* keys[] = {L"right_cm", L"up_cm", L"forward_cm"};
+    for (int index = 0; index < kHolsterCount; ++index)
+    {
+        for (int hand = 0; hand < 2; ++hand)
+        {
+            std::wstring section = HolsterSection(index, hand);
+            Holster& holster = s.holsters[index][hand];
+            holster.samples = static_cast<int>(GetPrivateProfileIntW(section.c_str(), L"samples", 0, s.holsterPath.c_str()));
+            float values[3] = {};
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                wchar_t buffer[64] = {};
+                GetPrivateProfileStringW(section.c_str(), keys[axis], L"0", buffer, 64, s.holsterPath.c_str());
+                values[axis] = std::wcstof(buffer, nullptr) / 100.0f;
+            }
+            holster.local = {values[0], values[1], values[2]};
+            holster.learned = holster.samples > 0;
+            if (holster.learned)
+                Log("holster %s (%s hand): right %.0f up %.0f forward %.0f cm, %d samples", kHolsterNames[index], kHandNames[hand], values[0] * 100.0f,
+                    values[1] * 100.0f, values[2] * 100.0f, holster.samples);
+        }
+    }
+}
+
+void SaveHolster(const LayerState& s, int index, int hand)
+{
+    const Holster& holster = s.holsters[index][hand];
+    std::wstring section = HolsterSection(index, hand);
+    const wchar_t* keys[] = {L"right_cm", L"up_cm", L"forward_cm"};
+    float values[] = {holster.local.x, holster.local.y, holster.local.z};
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        wchar_t buffer[64] = {};
+        swprintf_s(buffer, L"%.1f", values[axis] * 100.0f);
+        WritePrivateProfileStringW(section.c_str(), keys[axis], buffer, s.holsterPath.c_str());
+    }
+    WritePrivateProfileStringW(section.c_str(), L"samples", std::to_wstring(holster.samples).c_str(), s.holsterPath.c_str());
+}
+
 void InitializeOnce()
 {
     static std::once_flag once;
@@ -266,6 +458,12 @@ void InitializeOnce()
         Log("config: sprint=%d hand=%s start_below_eyes_cm=%d stop_below_eyes_cm=%d mode=%s stop_method=%s stop_frames=%d", s.config.sprintEnabled,
             s.config.sprintHand.c_str(), s.config.sprintStartBelowEyesCm, s.config.sprintStopBelowEyesCm, s.config.sprintMode.c_str(),
             s.config.sprintStopMethod.c_str(), s.config.sprintStopFrames);
+        Log("config: weapon_switch=%d method=%s release_frames=%d move_frames=%d grab_frames=%d timeout_ms=%d", s.config.weaponSwitchEnabled,
+            s.config.weaponSwitchMethod.c_str(), s.config.weaponSwitchReleaseFrames, s.config.weaponSwitchMoveFrames, s.config.weaponSwitchGrabFrames,
+            s.config.weaponSwitchTimeoutMs);
+        Log("config: holsters learn=%d assist=%d assist_radius_cm=%d", s.config.holsterLearn, s.config.holsterAssist, s.config.holsterAssistRadiusCm);
+        s.holsterPath = s.directory + L"\\" + kHolsterFileName;
+        LoadHolsters(s);
     });
 }
 
@@ -356,6 +554,352 @@ void TrackHeld(GripSlot& grip, float output)
     grip.held = held;
 }
 
+void UpdateCommandAction(LayerState& s, XrSession session, XrAction action, ButtonState& button, const char* label, const std::string& pressCommand,
+                         const std::string& releaseCommand, std::vector<std::string>& commands);
+const char* ReferenceSpaceName(const LayerState& s, XrSpace space);
+
+int HandIndex(const LayerState& s, XrPath hand)
+{
+    return hand == s.leftHand ? 0 : hand == s.rightHand ? 1 : -1;
+}
+
+int HolsterIndex(int slot)
+{
+    for (int index = 0; index < kHolsterCount; ++index)
+        if (kHolsterSlots[index] == slot)
+            return index;
+    return -1;
+}
+
+const char* HolsterName(int slot)
+{
+    int index = HolsterIndex(slot);
+    return index < 0 ? "unknown" : kHolsterNames[index];
+}
+
+bool Owned(const LayerState& s, int slot)
+{
+    return (s.holsterMask & (1 << slot)) != 0;
+}
+
+Vec3 ToLocal(const HeadFrame& head, Vec3 point)
+{
+    Vec3 offset = point - head.position;
+    return {Dot(offset, head.right), offset.y, Dot(offset, head.forward)};
+}
+
+Vec3 ToWorld(const HeadFrame& head, Vec3 local)
+{
+    return head.position + head.right * local.x + Vec3{0.0f, local.y, 0.0f} + head.forward * local.z;
+}
+
+bool HandLocatable(const LayerState& s, int hand)
+{
+    return hand >= 0 && s.hands[hand].valid && s.head.valid && s.hands[hand].base == s.head.base;
+}
+
+void UpdateGameVars(LayerState& s)
+{
+    int value = 0;
+    s.holsterMask = s.holsterMaskVar.ReadInt(value) ? value : 0;
+    s.gunSlot = s.gunSlotVar.ReadInt(value) ? value : -1;
+    int active = s.activeSlotVar.ReadInt(value) ? value : kActiveSlotUnknown;
+    if (active != s.activeSlot)
+        Log("active slot %d (%s)", active, active == kActiveSlotUnknown ? "unknown" : active < 0 ? "empty hands" : HolsterName(active));
+    s.activeSlot = active;
+    s.pickup[0] = s.pickupLeftVar.ReadInt(value) ? value : -1;
+    s.pickup[1] = s.pickupRightVar.ReadInt(value) ? value : -1;
+}
+
+// where the hand was when the grip closed, so a later gun or grenade ack can teach the holster position
+void SnapshotPress(LayerState& s, GripSlot& grip)
+{
+    int hand = HandIndex(s, grip.path);
+    grip.pressSynthetic = s.weaponSwitch.phase != SwitchPhase::Idle && s.weaponSwitch.hand == grip.path;
+    grip.pressPickup = hand >= 0 && s.pickup[hand] != -1;
+    grip.pressValid = HandLocatable(s, hand);
+    if (grip.pressValid)
+        grip.pressLocal = ToLocal(s.head, s.hands[hand].position);
+}
+
+void LearnHolster(LayerState& s, const GripSlot& grip, int slot)
+{
+    int index = HolsterIndex(slot);
+    int hand = HandIndex(s, grip.path);
+    if (!s.config.holsterLearn || index < 0 || hand < 0)
+        return;
+    const char* skip = grip.pressSynthetic ? "faked grab" : grip.pressPickup ? "picked up from the world" : !grip.pressValid ? "hand or head pose unavailable" : nullptr;
+    if (skip)
+    {
+        Log("%s holster not learned: %s", kHolsterNames[index], skip);
+        return;
+    }
+    Holster& holster = s.holsters[index][hand];
+    holster.local = holster.learned ? holster.local + (grip.pressLocal - holster.local) * kHolsterLearnRate : grip.pressLocal;
+    holster.learned = true;
+    holster.samples = std::min(holster.samples + 1, 1000);
+    Log("%s holster (%s hand) learned: grabbed at right %.0f up %.0f forward %.0f cm, now right %.0f up %.0f forward %.0f cm (%d samples)",
+        kHolsterNames[index], kHandNames[hand], grip.pressLocal.x * 100.0f, grip.pressLocal.y * 100.0f, grip.pressLocal.z * 100.0f,
+        holster.local.x * 100.0f, holster.local.y * 100.0f, holster.local.z * 100.0f, holster.samples);
+    SaveHolster(s, index, hand);
+}
+
+void EndSwitch(LayerState& s, const char* message)
+{
+    WeaponSwitch& w = s.weaponSwitch;
+    Log("%s %s: %s", w.assist ? "assisted grab of" : "switch to", HolsterName(w.slot), message);
+    w = {};
+}
+
+// runs once per frame before the grips are sampled; sets the squeeze and pose override for this frame
+void AdvanceWeaponSwitch(LayerState& s)
+{
+    WeaponSwitch& w = s.weaponSwitch;
+    w.squeeze = -1.0f;
+    w.spoof = false;
+    if (w.phase == SwitchPhase::Idle)
+        return;
+    if (s.menuState != 0 && w.phase != SwitchPhase::Confirm)
+    {
+        EndSwitch(s, "cancelled by a menu");
+        return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    int release = std::max(s.config.weaponSwitchReleaseFrames, 1);
+    for (;;)
+    {
+        switch (w.phase)
+        {
+        case SwitchPhase::Idle:
+            return;
+        case SwitchPhase::Release:
+        {
+            // Hold grip lets go by releasing; Toggle grip lets go with one more press
+            int length = w.toggle ? kTogglePulseFrames + release : release;
+            if (w.frame >= length)
+            {
+                w.phase = SwitchPhase::WaitEmpty;
+                w.frame = 0;
+                continue;
+            }
+            w.squeeze = w.toggle && w.frame < kTogglePulseFrames ? 1.0f : 0.0f;
+            ++w.frame;
+            return;
+        }
+        case SwitchPhase::WaitEmpty:
+            if (s.activeSlot == -1 || (s.activeSlot == kActiveSlotUnknown && w.frame >= release))
+            {
+                Log("switch: current gun holstered after %d frames", w.frame);
+                w.phase = SwitchPhase::Move;
+                w.frame = 0;
+                continue;
+            }
+            if (now > w.deadline)
+            {
+                EndSwitch(s, "the current gun was not holstered in time, giving up");
+                return;
+            }
+            w.squeeze = 0.0f;
+            ++w.frame;
+            return;
+        case SwitchPhase::Move:
+            if (w.frame >= std::max(s.config.weaponSwitchMoveFrames, 1))
+            {
+                w.phase = SwitchPhase::Grab;
+                w.frame = 0;
+                continue;
+            }
+            w.squeeze = 0.0f;
+            w.spoof = true;
+            ++w.frame;
+            return;
+        case SwitchPhase::Grab:
+            if (w.frame >= std::max(s.config.weaponSwitchGrabFrames, 1))
+            {
+                GripSlot* grip = FindGrip(s, w.hand);
+                if (!w.assist && !w.toggle && grip && !grip->rawPressed)
+                {
+                    grip->forceHeld = true;
+                    Log("switch: %s hand keeps the gun until you squeeze grip", grip->name);
+                }
+                w.phase = SwitchPhase::Confirm;
+                w.frame = 0;
+                w.deadline = now + std::chrono::milliseconds(std::max(s.config.weaponSwitchTimeoutMs, 1));
+                continue;
+            }
+            w.squeeze = 1.0f;
+            w.spoof = true;
+            ++w.frame;
+            return;
+        case SwitchPhase::Confirm:
+            if (s.gunAck != w.startGunAck || s.grenadeAck != w.startGrenadeAck)
+            {
+                EndSwitch(s, "confirmed by the game");
+                return;
+            }
+            if (now > w.deadline)
+            {
+                EndSwitch(s, "no gun or grenade ack from the game, the holster position may be off");
+                return;
+            }
+            ++w.frame;
+            return;
+        }
+    }
+}
+
+void BeginGrab(LayerState& s, bool assist, XrPath hand, int slot, Vec3 target, bool holding)
+{
+    WeaponSwitch& w = s.weaponSwitch;
+    int toggle = 0;
+    if (!s.gunGripToggleVar.ReadInt(toggle))
+        toggle = 0;
+    w = {};
+    w.assist = assist;
+    w.toggle = toggle == 1;
+    w.hand = hand;
+    w.slot = slot;
+    w.target = target;
+    w.phase = holding ? SwitchPhase::Release : SwitchPhase::Move;
+    w.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(s.config.weaponSwitchTimeoutMs, 1));
+    w.startGunAck = s.gunAck;
+    w.startGrenadeAck = s.grenadeAck;
+    for (GripSlot& grip : s.grips)
+        grip.forceHeld = false;
+}
+
+int NextGunSlot(const LayerState& s)
+{
+    int current = s.activeSlot >= 0 ? s.activeSlot : -1;
+    if (current < 0 && s.gunSlot >= 0 && Owned(s, s.gunSlot))
+        return s.gunSlot;
+    int position = 2;
+    for (int i = 0; i < 3; ++i)
+        if (kGunSlots[i] == current)
+            position = i;
+    for (int step = 1; step <= 3; ++step)
+    {
+        int slot = kGunSlots[(position + step) % 3];
+        if (Owned(s, slot) && slot != current)
+            return slot;
+    }
+    return -1;
+}
+
+void StartWeaponSwitch(LayerState& s, int slot, std::vector<std::string>& commands)
+{
+    int hand = HandIndex(s, s.gunHand);
+    int index = HolsterIndex(slot);
+    const Holster* holster = hand >= 0 && index >= 0 ? &s.holsters[index][hand] : nullptr;
+    bool learned = holster && holster->learned;
+    if (s.config.weaponSwitchMethod == "command" || !learned)
+    {
+        if (!learned && s.config.weaponSwitchMethod != "command")
+            Log("switch to %s: holster not learned for the %s hand yet, draw it once by hand; trying the console command instead", HolsterName(slot),
+                HandName(s, s.gunHand));
+        ++s.commandTicket;
+        commands.push_back("tf2vr_draw " + std::to_string(s.commandTicket) + " " + std::to_string(slot));
+        return;
+    }
+    const GripSlot* grip = FindGrip(s, s.gunHand);
+    bool holding = s.activeSlot >= 0 || (s.activeSlot == kActiveSlotUnknown && grip && grip->held);
+    BeginGrab(s, false, s.gunHand, slot, holster->local, holding);
+    Log("switch to %s with the %s hand (%s grip)%s", HolsterName(slot), HandName(s, s.gunHand), s.weaponSwitch.toggle ? "toggle" : "hold",
+        holding ? ", holstering the current gun first" : "");
+}
+
+void UpdateWeaponButtons(LayerState& s, XrSession session, std::vector<std::string>& commands)
+{
+    std::vector<std::string> none;
+    UpdateCommandAction(s, session, s.nextWeapon, s.nextWeaponButton, "next weapon", {}, {}, none);
+    UpdateCommandAction(s, session, s.drawPrimary, s.drawPrimaryButton, "draw primary", {}, {}, none);
+    UpdateCommandAction(s, session, s.drawSecondary, s.drawSecondaryButton, "draw secondary", {}, {}, none);
+    auto pressed = [](const ButtonState& button) { return button.changed && button.pressed; };
+    int slot = -2;
+    if (pressed(s.nextWeaponButton))
+        slot = NextGunSlot(s);
+    else if (pressed(s.drawPrimaryButton))
+        slot = 0;
+    else if (pressed(s.drawSecondaryButton))
+        slot = 1;
+    if (slot == -2)
+        return;
+
+    const char* blocked = s.menuState != 0 ? "menu open" : s.weaponSwitch.phase != SwitchPhase::Idle ? "a switch is already running"
+                        : s.reloadWaiting                                         ? "reloading"
+                        : slot < 0                                                ? "no other gun to switch to"
+                        : !Owned(s, slot)                                         ? "you don't carry that gun"
+                        : slot == s.activeSlot                                    ? "already in hand"
+                                                                                  : nullptr;
+    if (blocked)
+    {
+        Log("weapon switch ignored: %s (holster mask 0x%x, active slot %d)", blocked, s.holsterMask, s.activeSlot);
+        return;
+    }
+    StartWeaponSwitch(s, slot, commands);
+}
+
+// a grip press near a learned holster is moved into it, which makes every holster bigger
+void TryStartAssist(LayerState& s, const GripSlot& grip)
+{
+    int hand = HandIndex(s, grip.path);
+    if (!s.config.holsterAssist || s.weaponSwitch.phase != SwitchPhase::Idle || s.menuState != 0 || s.reloadWaiting || !HandLocatable(s, hand))
+        return;
+    if (s.pickup[hand] != -1 || (grip.path == s.gunHand && s.activeSlot >= 0))
+        return;
+    Vec3 local = ToLocal(s.head, s.hands[hand].position);
+    int best = -1;
+    float bestDistance = 0.0f;
+    for (int index = 0; index < kHolsterCount; ++index)
+    {
+        int slot = kHolsterSlots[index];
+        const Holster& holster = s.holsters[index][hand];
+        if (!holster.learned || !Owned(s, slot) || slot == s.activeSlot)
+            continue;
+        float distance = Length(local - holster.local);
+        if (best < 0 || distance < bestDistance)
+        {
+            best = index;
+            bestDistance = distance;
+        }
+    }
+    if (best < 0 || bestDistance * 100.0f > static_cast<float>(s.config.holsterAssistRadiusCm))
+        return;
+    BeginGrab(s, true, grip.path, kHolsterSlots[best], s.holsters[best][hand].local, false);
+    Log("assisted grab: %s hand %.0f cm from the %s holster", grip.name, bestDistance * 100.0f, kHolsterNames[best]);
+    AdvanceWeaponSwitch(s);
+}
+
+void SpoofHandPose(LayerState& s, XrSpace space, XrSpace baseSpace, XrSpaceLocationFlags flags, XrPosef& pose)
+{
+    const WeaponSwitch& w = s.weaponSwitch;
+    if (!w.spoof || !(flags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+        return;
+    auto it = std::find_if(s.handSpaces.begin(), s.handSpaces.end(), [space](const HandSpace& h) { return h.space == space; });
+    if (it == s.handSpaces.end() || it->hand != w.hand)
+        return;
+    int hand = HandIndex(s, w.hand);
+    if (!HandLocatable(s, hand) || baseSpace != s.head.base)
+    {
+        if (!s.loggedSpoofBase)
+        {
+            s.loggedSpoofBase = true;
+            Log("cannot move the %s hand: hand located relative to %s space, head relative to %s", HandName(s, w.hand), ReferenceSpaceName(s, baseSpace),
+                ReferenceSpaceName(s, s.head.base));
+        }
+        return;
+    }
+    Vec3 delta = ToWorld(s.head, w.target) - s.hands[hand].position;
+    if (!w.loggedSpoof)
+    {
+        s.weaponSwitch.loggedSpoof = true;
+        Log("%s hand moved %.0f cm to the %s holster", HandName(s, w.hand), Length(delta) * 100.0f, HolsterName(w.slot));
+    }
+    pose.position.x += delta.x;
+    pose.position.y += delta.y;
+    pose.position.z += delta.z;
+}
+
 void UpdateReloadState(LayerState& s)
 {
     int highlight = 0;
@@ -405,6 +949,8 @@ void UpdateSqueeze(LayerState& s, XrSession session)
         if (rawEdge)
             grip.pressAt = now;
         grip.rawPressed = rawPressed;
+        if (rawEdge)
+            TryStartAssist(s, grip);
 
         bool routed = grip.grabBound && s.reloadWaiting && grip.path != s.gunHand && !grip.grenadeHeld;
         if (routed != grip.routed)
@@ -436,12 +982,34 @@ void UpdateSqueeze(LayerState& s, XrSession session)
         {
             output = grip.output;
         }
+
+        const WeaponSwitch& w = s.weaponSwitch;
+        bool faked = w.phase != SwitchPhase::Idle && w.hand == grip.path && w.squeeze >= 0.0f;
+        if (faked)
+        {
+            output = w.squeeze;
+        }
+        else if (grip.forceHeld)
+        {
+            if (rawEdge || s.menuState != 0)
+            {
+                grip.forceHeld = false;
+                Log("%s hand: grip back to normal", grip.name);
+            }
+            else
+            {
+                output = 1.0f;
+            }
+        }
         grip.changed = output != grip.output;
         grip.sampled = routed || grip.changed || output != raw;
         if (grip.changed)
-            grip.changeTime = routed ? grabTime : squeeze.lastChangeTime;
+            grip.changeTime = routed ? grabTime : faked || grip.forceHeld ? std::max(squeeze.lastChangeTime, s.head.time) : squeeze.lastChangeTime;
         grip.output = output;
+        bool wasHeld = grip.held;
         TrackHeld(grip, output);
+        if (grip.held && !wasHeld)
+            SnapshotPress(s, grip);
     }
 }
 
@@ -487,6 +1055,11 @@ void UpdateGrenade(LayerState& s)
     if (ack == s.grenadeAck)
         return;
     s.grenadeAck = ack;
+    if (ack > 0)
+    {
+        if (const GripSlot* grabbed = RecentGrab(s))
+            LearnHolster(s, *grabbed, kGrenadeSlot);
+    }
     if (ack <= 0 || !active)
         return;
 
@@ -530,7 +1103,8 @@ void UpdateGunHand(LayerState& s)
         return;
     }
     s.gunHand = newest->path;
-    Log("gun ack %d: gun hand %s", ack, newest->name);
+    Log("gun ack %d: gun hand %s, slot %d", ack, newest->name, s.gunSlot);
+    LearnHolster(s, *newest, s.gunSlot);
 }
 
 void UpdateCommandAction(LayerState& s, XrSession session, XrAction action, ButtonState& button, const char* label, const std::string& pressCommand,
@@ -744,6 +1318,9 @@ void RecordAimPose(LayerState& s, XrSpace space, XrSpace baseSpace, XrTime time,
     auto it = std::find_if(s.aimSpaces.begin(), s.aimSpaces.end(), [space](const AimSpace& aim) { return aim.space == space; });
     if (it == s.aimSpaces.end())
         return;
+    int hand = HandIndex(s, it->hand);
+    if (hand >= 0 && (flags & XR_SPACE_LOCATION_POSITION_VALID_BIT) && time >= s.hands[hand].time)
+        s.hands[hand] = {true, FromXr(pose.position), baseSpace, time};
     if (!s.loggedAimLocate)
     {
         s.loggedAimLocate = true;
@@ -770,6 +1347,23 @@ void RecordHead(LayerState& s, XrSpace baseSpace, XrTime time, const XrView* vie
     s.headBase = baseSpace;
     s.headTime = time;
     s.headValid = true;
+
+    Vec3 position;
+    for (uint32_t i = 0; i < count; ++i)
+        position = position + FromXr(views[i].pose.position);
+    s.head.position = position * (1.0f / static_cast<float>(count));
+    Vec3 forward = Rotate(views[0].pose.orientation, {0.0f, 0.0f, -1.0f});
+    forward.y = 0.0f;
+    float length = Length(forward);
+    // looking straight up or down keeps the last heading
+    if (length > 0.1f)
+    {
+        s.head.forward = forward * (1.0f / length);
+        s.head.right = {-s.head.forward.z, 0.0f, s.head.forward.x};
+    }
+    s.head.base = baseSpace;
+    s.head.time = time;
+    s.head.valid = true;
 }
 
 void UpdateSprint(LayerState& s, XrSession session)
@@ -882,6 +1476,18 @@ XrResult XRAPI_CALL HookDestroyInstance(XrInstance instance)
     s.headValid = false;
     s.headTime = 0;
     s.sprint = {};
+    s.poseActions.clear();
+    s.handSpaces.clear();
+    s.hands[0] = {};
+    s.hands[1] = {};
+    s.head = {};
+    s.nextWeapon = XR_NULL_HANDLE;
+    s.drawPrimary = XR_NULL_HANDLE;
+    s.drawSecondary = XR_NULL_HANDLE;
+    s.nextWeaponButton = {};
+    s.drawPrimaryButton = {};
+    s.drawSecondaryButton = {};
+    s.weaponSwitch = {};
     s.instance = XR_NULL_HANDLE;
     Log("instance destroyed (%d)", result);
     return result;
@@ -902,13 +1508,23 @@ XrResult XRAPI_CALL HookCreateActionSet(XrInstance instance, const XrActionSetCr
     XrAction crouch = s.config.crouchEnabled ? CreateLayerAction(s, *actionSet, kCrouchActionName, kCrouchLocalizedName, {}) : XR_NULL_HANDLE;
     XrAction reloadGrab =
         s.config.reloadGrabEnabled ? CreateLayerAction(s, *actionSet, kReloadGrabActionName, kReloadGrabLocalizedName, {s.leftHand, s.rightHand}) : XR_NULL_HANDLE;
+    bool weapons = s.config.weaponSwitchEnabled;
+    XrAction nextWeapon = weapons ? CreateLayerAction(s, *actionSet, kNextWeaponActionName, kNextWeaponLocalizedName, {}) : XR_NULL_HANDLE;
+    XrAction drawPrimary = weapons ? CreateLayerAction(s, *actionSet, kDrawPrimaryActionName, kDrawPrimaryLocalizedName, {}) : XR_NULL_HANDLE;
+    XrAction drawSecondary = weapons ? CreateLayerAction(s, *actionSet, kDrawSecondaryActionName, kDrawSecondaryLocalizedName, {}) : XR_NULL_HANDLE;
 
     std::lock_guard lock(s.mutex);
     s.tactical = tactical;
     s.crouch = crouch;
     s.reloadGrab = reloadGrab;
+    s.nextWeapon = nextWeapon;
+    s.drawPrimary = drawPrimary;
+    s.drawSecondary = drawSecondary;
     s.tacticalButton = {};
     s.crouchButton = {};
+    s.nextWeaponButton = {};
+    s.drawPrimaryButton = {};
+    s.drawSecondaryButton = {};
     return result;
 }
 
@@ -921,6 +1537,8 @@ XrResult XRAPI_CALL HookCreateAction(XrActionSet actionSet, const XrActionCreate
 
     Log("action '%s' type %d subaction paths %u", createInfo->actionName, createInfo->actionType, createInfo->countSubactionPaths);
     std::lock_guard lock(s.mutex);
+    if (createInfo->actionType == XR_ACTION_TYPE_POSE_INPUT)
+        s.poseActions.push_back(*action);
     if (createInfo->actionType == XR_ACTION_TYPE_POSE_INPUT && std::strcmp(createInfo->actionName, kAimActionName) == 0)
         s.aim = *action;
     else if (createInfo->actionType == XR_ACTION_TYPE_BOOLEAN_INPUT && std::strcmp(createInfo->actionName, kJumpActionName) == 0)
@@ -962,6 +1580,16 @@ XrResult XRAPI_CALL HookCreateActionSpace(XrSession session, const XrActionSpace
     if (XR_FAILED(result) || !createInfo || !space)
         return result;
     std::lock_guard lock(s.mutex);
+    bool pose = std::find(s.poseActions.begin(), s.poseActions.end(), createInfo->action) != s.poseActions.end();
+    if (pose && HandIndex(s, createInfo->subactionPath) >= 0)
+    {
+        s.handSpaces.push_back({*space, createInfo->subactionPath});
+        Log("pose space created for %s hand", HandName(s, createInfo->subactionPath));
+    }
+    else if (pose)
+    {
+        Log("pose space created without a hand path (%s), it will not follow faked grabs", PathText(s, createInfo->subactionPath).c_str());
+    }
     if (s.aim == XR_NULL_HANDLE || createInfo->action != s.aim)
         return result;
     s.aimSpaces.push_back({*space, createInfo->subactionPath});
@@ -977,6 +1605,7 @@ XrResult XRAPI_CALL HookLocateSpace(XrSpace space, XrSpace baseSpace, XrTime tim
         return result;
     std::lock_guard lock(s.mutex);
     RecordAimPose(s, space, baseSpace, time, location->locationFlags, location->pose);
+    SpoofHandPose(s, space, baseSpace, location->locationFlags, location->pose);
     return result;
 }
 
@@ -989,8 +1618,11 @@ XrResult XRAPI_CALL HookLocateSpaces(XrSession session, const XrSpacesLocateInfo
     std::lock_guard lock(s.mutex);
     uint32_t count = std::min(locateInfo->spaceCount, spaceLocations->locationCount);
     for (uint32_t i = 0; i < count; ++i)
-        RecordAimPose(s, locateInfo->spaces[i], locateInfo->baseSpace, locateInfo->time, spaceLocations->locations[i].locationFlags,
-                      spaceLocations->locations[i].pose);
+    {
+        XrSpaceLocationData& location = spaceLocations->locations[i];
+        RecordAimPose(s, locateInfo->spaces[i], locateInfo->baseSpace, locateInfo->time, location.locationFlags, location.pose);
+        SpoofHandPose(s, locateInfo->spaces[i], locateInfo->baseSpace, location.locationFlags, location.pose);
+    }
     return result;
 }
 
@@ -1026,6 +1658,9 @@ XrResult XRAPI_CALL HookSyncActions(XrSession session, const XrActionsSyncInfo* 
         ++s.frame;
         UpdateMenuState(s);
         UpdateReloadState(s);
+        UpdateGameVars(s);
+        UpdateWeaponButtons(s, session, commands);
+        AdvanceWeaponSwitch(s);
         if (s.squeeze != XR_NULL_HANDLE)
         {
             UpdateSqueeze(s, session);

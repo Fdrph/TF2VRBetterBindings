@@ -27,6 +27,15 @@ struct Config
     std::string sprintMode = "hold";
     std::string sprintStopMethod = "stick";
     int sprintStopFrames = 6;
+    bool weaponSwitchEnabled = true;
+    std::string weaponSwitchMethod = "grab";
+    int weaponSwitchReleaseFrames = 4;
+    int weaponSwitchMoveFrames = 3;
+    int weaponSwitchGrabFrames = 4;
+    int weaponSwitchTimeoutMs = 750;
+    bool holsterLearn = true;
+    bool holsterAssist = true;
+    int holsterAssistRadiusCm = 15;
 };
 
 Config LoadConfig(const std::wstring& path);

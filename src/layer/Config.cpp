@@ -75,6 +75,15 @@ Config LoadConfig(const std::wstring& path)
     config.sprintMode = ReadNarrow(path, L"sprint", L"mode", config.sprintMode);
     config.sprintStopMethod = ReadNarrow(path, L"sprint", L"stop_method", config.sprintStopMethod);
     config.sprintStopFrames = ReadInt(path, L"sprint", L"stop_frames", config.sprintStopFrames);
+    config.weaponSwitchEnabled = ReadBool(path, L"weapon_switch", L"enabled", config.weaponSwitchEnabled);
+    config.weaponSwitchMethod = ReadNarrow(path, L"weapon_switch", L"method", config.weaponSwitchMethod);
+    config.weaponSwitchReleaseFrames = ReadInt(path, L"weapon_switch", L"release_frames", config.weaponSwitchReleaseFrames);
+    config.weaponSwitchMoveFrames = ReadInt(path, L"weapon_switch", L"move_frames", config.weaponSwitchMoveFrames);
+    config.weaponSwitchGrabFrames = ReadInt(path, L"weapon_switch", L"grab_frames", config.weaponSwitchGrabFrames);
+    config.weaponSwitchTimeoutMs = ReadInt(path, L"weapon_switch", L"timeout_ms", config.weaponSwitchTimeoutMs);
+    config.holsterLearn = ReadBool(path, L"holsters", L"learn", config.holsterLearn);
+    config.holsterAssist = ReadBool(path, L"holsters", L"assist", config.holsterAssist);
+    config.holsterAssistRadiusCm = ReadInt(path, L"holsters", L"assist_radius_cm", config.holsterAssistRadiusCm);
     return config;
 }
 }

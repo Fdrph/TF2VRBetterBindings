@@ -1,6 +1,6 @@
 {
     "Name": "Nighteyes.TF2VRBetterBindings",
-    "Description": "Extra SteamVR actions for Titanfall 2 VR (Toggle Grip, Crouch, Tactical Ability). Reports menu and start-screen state to the TF2VR Better Bindings OpenXR layer.",
+    "Description": "Extra SteamVR actions for Titanfall 2 VR (Toggle Grip, Crouch, Tactical Ability, weapon switching). Reports menu, start-screen and weapon state to the TF2VR Better Bindings OpenXR layer.",
     "Version": "@PROJECT_VERSION@",
     "LoadPriority": 3,
     "Dependencies": {
@@ -8,13 +8,19 @@
     },
     "ConVars": [
         { "Name": "tf2vrbb_menu_active", "DefaultValue": "1" },
-        { "Name": "tf2vrbb_startup_phase", "DefaultValue": "-1" }
+        { "Name": "tf2vrbb_startup_phase", "DefaultValue": "-1" },
+        { "Name": "tf2vrbb_active_slot", "DefaultValue": "-2" }
     ],
     "Scripts": [
         {
             "Path": "tf2vrbb_menu_state.nut",
             "RunOn": "UI",
             "UICallback": { "After": "TF2VRBB_MenuStateInit" }
+        },
+        {
+            "Path": "tf2vrbb_weapon_state.nut",
+            "RunOn": "CLIENT && SP",
+            "ClientCallback": { "After": "TF2VRBB_WeaponStateInit" }
         }
     ]
 }
