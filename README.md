@@ -11,8 +11,27 @@ Bind them in SteamVR → Settings → Controllers → **Manage Controller Bindin
 | **Reload Grab** | Grab magazines and rack slides with the trigger. While you reload, Grip on that hand grabs nothing, so Grip only holds the gun | Each **Trigger**, *Use as Button*, next to the mod's own trigger |
 | **Crouch** | Crouch | Any button: *Use as Button* to hold, *Use as Toggle Button* to toggle |
 | **Tactical Ability** | Cloak. The trigger of the hand without the gun then stops cloaking | Any button |
+| **Next Weapon** | Steps through primary → secondary → arc tool → empty hands, skipping what you don't carry. Change the order with `[weapon_switch] cycle` | Any button |
+| **Draw Primary Weapon** / **Draw Secondary Weapon** | Draws that gun | Any button |
+| **Detonate Satchels** | Sets off your planted satchels (needs Titanfall 2 VR 1.0.25 or newer) | Any button |
 
 Tip: set the mod's **VR Settings → Gun Grip** to **Toggle** to hold your gun with one press of Grip.
+
+### Holster learning and bigger holsters
+
+Every time you draw a gun or take a grenade by hand, the add-on remembers where your hand was, relative to your head, and saves it to `TF2VRBetterBindings.holsters.ini` next to the layer. The weapon buttons use these positions: they briefly move your hand into the holster and squeeze grip for you, so **draw each gun once by hand (with each hand you use) before the buttons work**. Until then the buttons fall back to a console command, which may switch the gun without putting it in your hand.
+
+With `[holsters] assist=1`, a grip press within `assist_radius_cm` (default 15) of a learned holster grabs from that holster, so the holsters act bigger. It never applies to the hand holding a gun, while reloading, or while you point at a pickup.
+
+Keep `TF2VRBetterBindings.holsters.ini` when you update the add-on.
+
+### Multiplayer
+
+Works with the Titanfall 2 VR multiplayer beta. Because matches are rated, the weapon buttons (except holstering to empty hands) and the bigger holsters are **off in multiplayer** unless you set `[multiplayer] button_draws=1` or `holster_assist=1`. Everything else works the same online.
+
+### PS VR2 adaptive triggers
+
+With PS VR2 Sense controllers and [PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit) installed, the trigger of the hand holding the gun pushes back differently for pistols, automatics, marksman rifles, shotguns, launchers, the arc tool and Titan weapons, buzzes while automatics fire, and goes loose on an empty magazine. It is off in menus and during reloads. Tune or turn it off in `[triggers]` of the `.ini`. Without PSVR2Toolkit nothing happens.
 
 > [!IMPORTANT]
 > **Optional features.** Turn them on in `TF2VR\packages\Nighteyes-TF2VRBetterBindings-<version>\plugins\layer\TF2VRBetterBindings.ini`, then restart the game.
@@ -34,6 +53,8 @@ Tip: set the mod's **VR Settings → Gun Grip** to **Toggle** to hold your gun w
 | `[sprint] start_below_eyes_cm` | `30` | How far below your eyes the gun must be to sprint |
 | `[sprint] stop_below_eyes_cm` | `20` | How close to your eyes the gun must come to stop |
 | `[reload_grab] enabled` | `1` | `0` = remove the **Reload Grab** action |
+| `[detonate] enabled` | `1` | `0` = remove the **Detonate Satchels** action |
+| `[weapon_switch] cycle` | `primary,secondary,arc_tool,empty` | What **Next Weapon** steps through, in order. Any of `primary`, `secondary`, `arc_tool`, `grenade`, `empty` (holster the gun) |
 
 </details>
 
