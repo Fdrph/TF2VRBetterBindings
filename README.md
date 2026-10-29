@@ -13,6 +13,7 @@ Bind them in SteamVR → Settings → Controllers → **Manage Controller Bindin
 | **Tactical Ability** | Cloak. The trigger of the hand without the gun then stops cloaking | Any button |
 | **Next Weapon** | Steps through primary → secondary → arc tool → empty hands, skipping what you don't carry. Change the order with `[weapon_switch] cycle` | Any button |
 | **Draw Primary Weapon** / **Draw Secondary Weapon** | Draws that gun | Any button |
+| **Detonate Satchels** | Sets off your planted satchels (needs Titanfall 2 VR 1.0.25 or newer) | Any button |
 
 Tip: set the mod's **VR Settings → Gun Grip** to **Toggle** to hold your gun with one press of Grip.
 
@@ -23,6 +24,10 @@ Every time you draw a gun or take a grenade by hand, the add-on remembers where 
 With `[holsters] assist=1`, a grip press within `assist_radius_cm` (default 15) of a learned holster grabs from that holster, so the holsters act bigger. It never applies to the hand holding a gun, while reloading, or while you point at a pickup.
 
 Keep `TF2VRBetterBindings.holsters.ini` when you update the add-on.
+
+### Multiplayer
+
+Works with the Titanfall 2 VR multiplayer beta. Because matches are rated, the weapon buttons (except holstering to empty hands) and the bigger holsters are **off in multiplayer** unless you set `[multiplayer] button_draws=1` or `holster_assist=1`. Everything else works the same online.
 
 ### PS VR2 adaptive triggers
 
@@ -48,6 +53,7 @@ With PS VR2 Sense controllers and [PSVR2Toolkit](https://github.com/BnuuySolutio
 | `[sprint] start_below_eyes_cm` | `30` | How far below your eyes the gun must be to sprint |
 | `[sprint] stop_below_eyes_cm` | `20` | How close to your eyes the gun must come to stop |
 | `[reload_grab] enabled` | `1` | `0` = remove the **Reload Grab** action |
+| `[detonate] enabled` | `1` | `0` = remove the **Detonate Satchels** action |
 | `[weapon_switch] cycle` | `primary,secondary,arc_tool,empty` | What **Next Weapon** steps through, in order. Any of `primary`, `secondary`, `arc_tool`, `grenade`, `empty` (holster the gun) |
 
 </details>

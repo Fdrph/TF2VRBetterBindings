@@ -41,6 +41,9 @@ struct Config
     bool holsterLearn = true;
     bool holsterAssist = true;
     int holsterAssistRadiusCm = 15;
+    bool detonateEnabled = true;
+    bool multiplayerButtonDraws = false;
+    bool multiplayerAssist = false;
     bool triggersEnabled = true;
     std::wstring triggersCapiPath;
     // adaptive trigger profile per tf2vrbb_trigger_kind, "<mode> <parameters>", see TriggerHaptics.h

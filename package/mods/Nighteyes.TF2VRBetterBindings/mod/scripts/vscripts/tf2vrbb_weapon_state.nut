@@ -34,9 +34,14 @@ void function TF2VRBB_WeaponStateThink()
 		file.triggerKinds[ name ] <- TF2VRBB_TRIGGER_LAUNCHER
 	file.triggerKinds[ CHARGE_TOOL ] <- TF2VRBB_TRIGGER_ARC_TOOL
 
+#if MP
+	SetConVarInt( "tf2vrbb_multiplayer", 1 )
+#else
+	SetConVarInt( "tf2vrbb_multiplayer", 0 )
+#endif
 	while ( true )
 	{
-		entity player = GetLocalViewPlayer()
+		entity player = GetLocalClientPlayer()
 		entity weapon = TF2VRBB_HeldWeapon( player )
 		SetConVarInt( "tf2vrbb_active_slot", TF2VRBB_ActiveSlot( player, weapon ) )
 		SetConVarInt( "tf2vrbb_trigger_kind", TF2VRBB_TriggerKind( player, weapon ) )
@@ -51,7 +56,8 @@ entity function TF2VRBB_HeldWeapon( entity player )
 	if ( !IsValid( player ) || !IsAlive( player ) )
 		return null
 	entity weapon = player.GetActiveWeapon()
-	if ( !IsValid( weapon ) || weapon.IsWeaponOffhand() || TF2VR_EmptyHands( weapon ) )
+	// the multiplayer build has no TF2VR_EmptyHands
+	if ( !IsValid( weapon ) || weapon.IsWeaponOffhand() || weapon.GetWeaponClassName() == "tf2vr_empty_hands" )
 		return null
 	return weapon
 }
@@ -61,7 +67,15 @@ int function TF2VRBB_ActiveSlot( entity player, entity weapon )
 {
 	if ( weapon == null || player.IsTitan() )
 		return -1
+#if MP
+	#if TF2VR_MULTIPLAYER
+	return TF2VR_MultiplayerGunSlot( weapon )
+	#else
+	return -1
+	#endif
+#else
 	return TF2VR_GunSlot( weapon )
+#endif
 }
 
 int function TF2VRBB_TriggerKind( entity player, entity weapon )

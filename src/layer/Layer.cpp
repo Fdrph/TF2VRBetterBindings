@@ -58,6 +58,10 @@ constexpr const char* kGunSlotVar = "tf2vr_gun_slot";
 constexpr const char* kActiveSlotVar = "tf2vrbb_active_slot";
 constexpr const char* kTriggerKindVar = "tf2vrbb_trigger_kind";
 constexpr const char* kClipVar = "tf2vrbb_clip";
+constexpr const char* kMultiplayerVar = "tf2vrbb_multiplayer";
+constexpr const char* kDetonateActionName = "tf2vr_detonate";
+constexpr const char* kDetonateLocalizedName = "Detonate Satchels";
+constexpr const char* kDetonateCommand = "tf2vr_detonate";
 constexpr const char* kPickupLeftVar = "tf2vr_pickup_left";
 constexpr const char* kPickupRightVar = "tf2vr_pickup_right";
 constexpr const wchar_t* kHolsterFileName = L"TF2VRBetterBindings.holsters.ini";
@@ -342,6 +346,10 @@ struct LayerState
     int pickup[2] = {-1, -1};
     WeaponSwitch weaponSwitch;
     std::vector<int> weaponCycle;
+    XrAction detonate = XR_NULL_HANDLE;
+    ButtonState detonateButton;
+    GameVar multiplayerVar{kMultiplayerVar};
+    bool multiplayer = false;
     GameVar triggerKindVar{kTriggerKindVar};
     GameVar clipVar{kClipVar};
     TriggerEffect triggerProfiles[kTriggerKindCount];
@@ -666,6 +674,16 @@ void UpdateGameVars(LayerState& s)
     s.activeSlot = active;
     s.pickup[0] = s.pickupLeftVar.ReadInt(value) ? value : -1;
     s.pickup[1] = s.pickupRightVar.ReadInt(value) ? value : -1;
+    bool multiplayer = s.multiplayerVar.ReadInt(value) && value == 1;
+    if (multiplayer != s.multiplayer)
+    {
+        if (multiplayer)
+            Log("multiplayer: button draws %s, holster assist %s", s.config.multiplayerButtonDraws ? "allowed" : "off",
+                s.config.multiplayerAssist ? "allowed" : "off");
+        else
+            Log("singleplayer");
+    }
+    s.multiplayer = multiplayer;
 }
 
 // where the hand was when the grip closed, so a later gun or grenade ack can teach the holster position
@@ -932,6 +950,7 @@ void UpdateWeaponButtons(LayerState& s, XrSession session, std::vector<std::stri
 
     const char* blocked = s.menuState != 0 ? "menu open" : s.weaponSwitch.phase != SwitchPhase::Idle ? "a switch is already running"
                         : s.reloadWaiting                                         ? "reloading"
+                        : s.multiplayer && !s.config.multiplayerButtonDraws && slot != kEmptyHandsSlot ? "off in multiplayer ([multiplayer] button_draws)"
                         : slot == -1                                              ? "no other gun to switch to"
                         : slot == kEmptyHandsSlot && s.activeSlot == -1           ? "hands already empty"
                         : slot >= 0 && !Owned(s, slot)                            ? "you don't carry that"
@@ -949,7 +968,7 @@ void UpdateWeaponButtons(LayerState& s, XrSession session, std::vector<std::stri
 void TryStartAssist(LayerState& s, const GripSlot& grip)
 {
     int hand = HandIndex(s, grip.path);
-    if (!s.config.holsterAssist || s.weaponSwitch.phase != SwitchPhase::Idle || s.menuState != 0 || s.reloadWaiting || !HandLocatable(s, hand))
+    if (!s.config.holsterAssist || (s.multiplayer && !s.config.multiplayerAssist) || s.weaponSwitch.phase != SwitchPhase::Idle || s.menuState != 0 || s.reloadWaiting || !HandLocatable(s, hand))
         return;
     if (s.pickup[hand] != -1 || (grip.path == s.gunHand && s.activeSlot >= 0))
         return;
@@ -1592,6 +1611,7 @@ XrResult XRAPI_CALL HookDestroyInstance(XrInstance instance)
     s.hands[1] = {};
     s.head = {};
     s.nextWeapon = XR_NULL_HANDLE;
+    s.detonate = XR_NULL_HANDLE;
     s.drawPrimary = XR_NULL_HANDLE;
     s.drawSecondary = XR_NULL_HANDLE;
     s.nextWeaponButton = {};
@@ -1622,6 +1642,7 @@ XrResult XRAPI_CALL HookCreateActionSet(XrInstance instance, const XrActionSetCr
     XrAction nextWeapon = weapons ? CreateLayerAction(s, *actionSet, kNextWeaponActionName, kNextWeaponLocalizedName, {}) : XR_NULL_HANDLE;
     XrAction drawPrimary = weapons ? CreateLayerAction(s, *actionSet, kDrawPrimaryActionName, kDrawPrimaryLocalizedName, {}) : XR_NULL_HANDLE;
     XrAction drawSecondary = weapons ? CreateLayerAction(s, *actionSet, kDrawSecondaryActionName, kDrawSecondaryLocalizedName, {}) : XR_NULL_HANDLE;
+    XrAction detonate = s.config.detonateEnabled ? CreateLayerAction(s, *actionSet, kDetonateActionName, kDetonateLocalizedName, {}) : XR_NULL_HANDLE;
 
     std::lock_guard lock(s.mutex);
     s.tactical = tactical;
@@ -1630,6 +1651,8 @@ XrResult XRAPI_CALL HookCreateActionSet(XrInstance instance, const XrActionSetCr
     s.nextWeapon = nextWeapon;
     s.drawPrimary = drawPrimary;
     s.drawSecondary = drawSecondary;
+    s.detonate = detonate;
+    s.detonateButton = {};
     s.tacticalButton = {};
     s.crouchButton = {};
     s.nextWeaponButton = {};
@@ -1781,6 +1804,7 @@ XrResult XRAPI_CALL HookSyncActions(XrSession session, const XrActionsSyncInfo* 
         UpdateCrouch(s, session, commands);
         UpdateCommandAction(s, session, s.tactical, s.tacticalButton, "tactical", s.config.tacticalPressCommand, s.config.tacticalReleaseCommand,
                             commands);
+        UpdateCommandAction(s, session, s.detonate, s.detonateButton, "detonate", kDetonateCommand, {}, commands);
         UpdateTacticalHand(s);
         UpdateTriggerOverride(s, session);
         UpdateSprint(s, session);

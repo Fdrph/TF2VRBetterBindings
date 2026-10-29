@@ -4,14 +4,16 @@
     "Version": "@PROJECT_VERSION@",
     "LoadPriority": 3,
     "Dependencies": {
-        "TF2VR_COCKPIT": "Titanfall2VR.Cockpit"
+        "TF2VR_COCKPIT": "Titanfall2VR.Cockpit",
+        "TF2VR_MULTIPLAYER": "Titanfall2VR.Multiplayer"
     },
     "ConVars": [
         { "Name": "tf2vrbb_menu_active", "DefaultValue": "1" },
         { "Name": "tf2vrbb_startup_phase", "DefaultValue": "-1" },
         { "Name": "tf2vrbb_active_slot", "DefaultValue": "-2" },
         { "Name": "tf2vrbb_trigger_kind", "DefaultValue": "0" },
-        { "Name": "tf2vrbb_clip", "DefaultValue": "-1" }
+        { "Name": "tf2vrbb_clip", "DefaultValue": "-1" },
+        { "Name": "tf2vrbb_multiplayer", "DefaultValue": "0" }
     ],
     "Scripts": [
         {
@@ -21,7 +23,7 @@
         },
         {
             "Path": "tf2vrbb_weapon_state.nut",
-            "RunOn": "CLIENT && SP",
+            "RunOn": "CLIENT",
             "ClientCallback": { "After": "TF2VRBB_WeaponStateInit" }
         }
     ]
