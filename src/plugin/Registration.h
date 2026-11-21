@@ -21,5 +21,4 @@ struct RegistrationReport
 };
 
 RegistrationReport RegisterImplicitLayer(HKEY root, const std::wstring& subkey, const std::wstring& manifestPath);
-int UnregisterImplicitLayer(HKEY root, const std::wstring& subkey, const std::wstring& manifestFileName);
 }

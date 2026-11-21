@@ -1,8 +1,3 @@
-#include "Config.h"
-#include "Engine.h"
-#include "GameVar.h"
-#include "Log.h"
-
 #include <windows.h>
 
 #include <openxr/openxr.h>
@@ -10,106 +5,236 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
-#include <cstdint>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
+#include <optional>
+#include <share.h>
 #include <string>
+#include <type_traits>
 #include <vector>
 
-namespace tf2vr
-{
 namespace
 {
-constexpr const wchar_t* kConfigFileName = L"TF2VRBetterBindings.ini";
-constexpr const wchar_t* kLogFileName = L"TF2VRBetterBindings.log";
-constexpr const char* kMenuActiveVar = "tf2vrbb_menu_active";
-constexpr const char* kStartupPhaseVar = "tf2vrbb_startup_phase";
-constexpr const char* kReloadHighlightVar = "tf2vr_reload_highlight";
-constexpr const char* kGunAckVar = "tf2vr_gun_ack";
-constexpr const char* kGrenadeAckVar = "tf2vr_grenade_ack";
-constexpr const char* kGunGripToggleVar = "tf2vr_toggle_grip";
-constexpr float kHeldThreshold = 0.5f;
-constexpr const char* kGameplaySetName = "gameplay";
-constexpr const char* kSqueezeActionName = "squeeze";
-constexpr const char* kTriggerActionName = "trigger";
-constexpr const char* kAimActionName = "aim";
-constexpr const char* kStickClickActionName = "stick_click";
-constexpr const char* kStickActionName = "stick";
-constexpr const char* kJumpActionName = "primary";
-constexpr uint64_t kSprintStopGapFrames = 2;
-constexpr uint64_t kJumpPulseFrames = 6;
-constexpr uint64_t kSprintPulseFrames = 8;
-constexpr uint64_t kPitchLogFrames = 90;
-constexpr const char* kCrouchActionName = "tf2vr_crouch";
-constexpr const char* kCrouchLocalizedName = "Crouch";
-constexpr const char* kTacticalActionName = "tf2vr_tactical";
-constexpr const char* kTacticalLocalizedName = "Tactical Ability (Cloak)";
-constexpr const char* kReloadGrabActionName = "tf2vr_reload_grab";
-constexpr const char* kReloadGrabLocalizedName = "Reload Grab";
-constexpr std::chrono::milliseconds kGunGrabWindow{500};
-constexpr std::chrono::milliseconds kReloadEndGrace{200};
-constexpr std::chrono::milliseconds kGrenadeMinPress{150};
-constexpr int kMaxLoggedQueries = 8;
+using Clock = std::chrono::steady_clock;
+using namespace std::chrono_literals;
 
-struct NextFunctions
+constexpr float kHeld = 0.5f;
+constexpr auto kGunGrabWindow = 500ms;
+constexpr auto kReloadEndGrace = 200ms;
+constexpr auto kGrenadeMinPress = 150ms;
+constexpr uint64_t kSprintStopGapFrames = 2;
+constexpr uint64_t kSprintStopFrames = 6;
+constexpr uint64_t kJumpTapFrames = 6;
+
+#ifdef TF2VRBB_LOGGING
+std::mutex g_logMutex;
+FILE* g_log = nullptr;
+
+void LogOpen(const std::wstring& path)
+{
+    g_log = _wfsopen(path.c_str(), L"w", _SH_DENYWR);
+}
+
+void Log(const char* format, ...)
+{
+    std::lock_guard lock(g_logMutex);
+    if (!g_log)
+        return;
+    SYSTEMTIME time;
+    GetLocalTime(&time);
+    std::fprintf(g_log, "[%02u:%02u:%02u.%03u] [t%lu] ", time.wHour, time.wMinute, time.wSecond, time.wMilliseconds, GetCurrentThreadId());
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(g_log, format, args);
+    va_end(args);
+    std::fputc('\n', g_log);
+    std::fflush(g_log);
+}
+#else
+void LogOpen(const std::wstring&)
+{
+}
+
+template <typename... Args>
+void Log(const char*, const Args&...)
+{
+}
+#endif
+
+struct Config
+{
+    bool reloadGrab;
+    bool grenadeToggle;
+    bool crouchButtonMode;
+    bool uncrouchOnJump;
+    int jumpDelayMs;
+    bool blockTrigger;
+    bool sprint;
+    int sprintStartCm;
+    int sprintStopCm;
+};
+
+Config LoadConfig(const std::wstring& path)
+{
+    auto number = [&](const wchar_t* section, const wchar_t* key, int fallback) {
+        return static_cast<int>(GetPrivateProfileIntW(section, key, fallback, path.c_str()));
+    };
+    wchar_t mode[32] = {};
+    GetPrivateProfileStringW(L"crouch", L"mode", L"toggle", mode, 32, path.c_str());
+    Config config;
+    config.reloadGrab = number(L"reload_grab", L"enabled", 1) != 0;
+    config.grenadeToggle = number(L"grenade", L"toggle", 0) != 0;
+    config.crouchButtonMode = std::wcscmp(mode, L"button") == 0;
+    config.uncrouchOnJump = number(L"crouch", L"uncrouch_on_jump", 0) != 0;
+    config.jumpDelayMs = std::max(number(L"crouch", L"jump_delay_ms", 250), 0);
+    config.blockTrigger = number(L"tactical", L"block_hand_trigger_in_game", 1) != 0;
+    config.sprint = number(L"sprint", L"enabled", 0) != 0;
+    config.sprintStartCm = number(L"sprint", L"start_below_eyes_cm", 30);
+    config.sprintStopCm = number(L"sprint", L"stop_below_eyes_cm", 20);
+    return config;
+}
+
+void* FindConVar(const char* name)
+{
+    __try
+    {
+        HMODULE vstdlib = GetModuleHandleW(L"vstdlib.dll");
+        auto createInterface = vstdlib ? reinterpret_cast<void* (*)(const char*, int*)>(GetProcAddress(vstdlib, "CreateInterface")) : nullptr;
+        void* cvar = createInterface ? createInterface("VEngineCvar007", nullptr) : nullptr;
+        if (!cvar)
+            return nullptr;
+        auto findVar = reinterpret_cast<void* (*)(void*, const char*)>((*static_cast<void***>(cvar))[16]);
+        auto conVar = static_cast<unsigned char*>(findVar(cvar, name));
+        const char* actual = conVar ? *reinterpret_cast<const char* const*>(conVar + 0x18) : nullptr;
+        return actual && std::strcmp(actual, name) == 0 ? conVar : nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+}
+
+struct GameVar
+{
+    const char* name;
+    unsigned char* conVar = nullptr;
+    ULONGLONG retryAt = 0;
+
+    std::optional<int> Read()
+    {
+        if (!conVar)
+        {
+            ULONGLONG now = GetTickCount64();
+            if (now < retryAt)
+                return std::nullopt;
+            retryAt = now + 1000;
+            conVar = static_cast<unsigned char*>(FindConVar(name));
+            if (!conVar)
+                return std::nullopt;
+            Log("game var %s found", name);
+        }
+        return *reinterpret_cast<const volatile int*>(conVar + 0x5C);
+    }
+};
+
+using CbufAddTextFn = void (*)(int target, const char* text, int source);
+
+CbufAddTextFn FindCbufAddText()
+{
+    constexpr uintptr_t rva = 0x1203B0;
+    constexpr unsigned char prologue[] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57,
+                                          0x48, 0x83, 0xEC, 0x20, 0x48, 0x63, 0xD9, 0x48, 0x8D, 0x0D};
+    auto base = reinterpret_cast<const unsigned char*>(GetModuleHandleW(L"engine.dll"));
+    if (!base)
+    {
+        Log("engine.dll is not loaded");
+        return nullptr;
+    }
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    if (nt->OptionalHeader.SizeOfImage < rva + sizeof(prologue) || std::memcmp(base + rva, prologue, sizeof(prologue)) != 0)
+    {
+        Log("engine: Cbuf_AddText not found, console commands disabled");
+        return nullptr;
+    }
+    return reinterpret_cast<CbufAddTextFn>(const_cast<unsigned char*>(base + rva));
+}
+
+bool GameCommand(const char* command)
+{
+    static const CbufAddTextFn addText = FindCbufAddText();
+    if (!addText)
+        return false;
+    addText(0, (std::string(command) + "\n").c_str(), 0);
+    return true;
+}
+
+template <typename State, typename Value>
+void Override(State* state, Value value, bool changed, XrTime changeTime)
+{
+    state->isActive = XR_TRUE;
+    state->currentState = value;
+    state->changedSinceLastSync = changed;
+    if (changed && changeTime != 0)
+        state->lastChangeTime = changeTime;
+}
+
+bool NewPositive(std::optional<int>& last, std::optional<int> value)
+{
+    if (!value)
+        return false;
+    bool fresh = last && *value != *last && *value > 0;
+    last = value;
+    return fresh;
+}
+
+struct Next
 {
     PFN_xrGetInstanceProcAddr getInstanceProcAddr = nullptr;
-    PFN_xrDestroyInstance destroyInstance = nullptr;
     PFN_xrStringToPath stringToPath = nullptr;
-    PFN_xrPathToString pathToString = nullptr;
     PFN_xrCreateActionSet createActionSet = nullptr;
     PFN_xrCreateAction createAction = nullptr;
     PFN_xrSyncActions syncActions = nullptr;
     PFN_xrGetActionStateFloat getActionStateFloat = nullptr;
     PFN_xrGetActionStateBoolean getActionStateBoolean = nullptr;
     PFN_xrGetActionStateVector2f getActionStateVector2f = nullptr;
-    PFN_xrCreateReferenceSpace createReferenceSpace = nullptr;
     PFN_xrCreateActionSpace createActionSpace = nullptr;
     PFN_xrLocateSpace locateSpace = nullptr;
     PFN_xrLocateSpaces locateSpaces = nullptr;
     PFN_xrLocateViews locateViews = nullptr;
 };
 
-struct AimSpace
-{
-    XrSpace space = XR_NULL_HANDLE;
-    XrPath hand = XR_NULL_PATH;
-};
-
-struct SprintState
-{
-    bool lowered = false;
-    bool pressed = false;
-    uint64_t pulseEnd = 0;
-    uint64_t stopStart = 0;
-    uint64_t stopEnd = 0;
-    bool stickZeroed = false;
-    bool stickChanged = false;
-    bool output = false;
-    bool changed = false;
-    XrTime changeTime = 0;
-};
-
-struct GripSlot
+struct Grip
 {
     XrPath path = XR_NULL_PATH;
     const char* name = "";
-    bool sampled = false;
-    bool routed = false;
     float output = 0.0f;
     bool changed = false;
     XrTime changeTime = 0;
-    bool held = false;
-    std::chrono::steady_clock::time_point heldAt;
+    bool sampled = false;
+    bool routed = false;
     bool grabBound = false;
+    bool grabPressed = false;
+    bool grabLatched = false;
     bool rawPressed = false;
-    std::chrono::steady_clock::time_point pressAt;
+    Clock::time_point pressAt;
+    bool held = false;
+    Clock::time_point heldAt;
     bool grenadeHeld = false;
     bool waitRelease = false;
 };
 
-struct ButtonState
+struct Pose
+{
+    bool valid = false;
+    float height = 0.0f;
+    XrSpace base = XR_NULL_HANDLE;
+    XrTime time = 0;
+};
+
+struct Button
 {
     bool active = false;
     bool pressed = false;
@@ -117,1173 +242,771 @@ struct ButtonState
     XrTime changeTime = 0;
 };
 
-struct CrouchState
+struct Layer
 {
-    bool jumpPressed = false;
-    bool inverted = false;
-    bool released = false;
-    bool ducked = false;
-    bool jumpPending = false;
-    std::chrono::steady_clock::time_point jumpReleaseAt;
-    uint64_t jumpPulseEnd = 0;
-    bool jumpOverride = false;
-    bool jumpOutput = false;
-    bool jumpChanged = false;
-};
-
-struct TriggerOverride
-{
-    bool applies = false;
-    bool blocked = false;
-    bool reloadBlocked = false;
-    bool waitRelease = false;
-    float output = 0.0f;
-    bool changed = false;
-    XrTime changeTime = 0;
-};
-
-struct LayerState
-{
-    std::mutex mutex;
-    bool active = false;
-    std::wstring directory;
-    Config config;
-    NextFunctions next;
+    Next next;
     XrInstance instance = XR_NULL_HANDLE;
-    XrPath leftHand = XR_NULL_PATH;
-    XrPath rightHand = XR_NULL_PATH;
+    XrPath left = XR_NULL_PATH;
+    XrPath right = XR_NULL_PATH;
+    XrPath gunHand = XR_NULL_PATH;
     XrPath tacticalHand = XR_NULL_PATH;
     XrAction squeeze = XR_NULL_HANDLE;
-    XrAction aim = XR_NULL_HANDLE;
-    XrAction stickClick = XR_NULL_HANDLE;
-    XrAction stick = XR_NULL_HANDLE;
-    XrPath sprintHand = XR_NULL_PATH;
-    std::vector<AimSpace> aimSpaces;
-    std::vector<std::pair<XrSpace, XrReferenceSpaceType>> referenceSpaces;
-    bool gunPoseValid = false;
-    float gunPitch = 0.0f;
-    float gunHeight = 0.0f;
-    XrSpace gunPoseBase = XR_NULL_HANDLE;
-    XrTime gunPoseTime = 0;
-    bool headValid = false;
-    float headHeight = 0.0f;
-    XrSpace headBase = XR_NULL_HANDLE;
-    XrTime headTime = 0;
-    uint64_t gunPoseLoggedFrame = 0;
-    bool loggedBaseMismatch = false;
-    bool loggedAimLocate = false;
-    SprintState sprint;
     XrAction trigger = XR_NULL_HANDLE;
+    XrAction aim = XR_NULL_HANDLE;
+    XrAction stick = XR_NULL_HANDLE;
+    XrAction stickClick = XR_NULL_HANDLE;
+    XrAction jump = XR_NULL_HANDLE;
     XrAction reloadGrab = XR_NULL_HANDLE;
     XrAction crouch = XR_NULL_HANDLE;
     XrAction tactical = XR_NULL_HANDLE;
-    std::vector<GripSlot> grips;
-    ButtonState crouchButton;
-    CrouchState crouchState;
-    XrAction jump = XR_NULL_HANDLE;
-    XrPath jumpHand = XR_NULL_PATH;
-    ButtonState tacticalButton;
-    TriggerOverride triggerOverride;
-    GameVar menuActiveVar{kMenuActiveVar};
-    GameVar startupPhaseVar{kStartupPhaseVar};
-    GameVar reloadHighlightVar{kReloadHighlightVar};
-    GameVar gunAckVar{kGunAckVar};
-    GameVar grenadeAckVar{kGrenadeAckVar};
-    GameVar gunGripToggleVar{kGunGripToggleVar};
-    int menuState = -2;
-    int startupPhase = -2;
-    int reloadHighlight = 0;
-    bool reloadWaiting = false;
-    std::chrono::steady_clock::time_point reloadSeenAt;
-    bool gunAckKnown = false;
-    int gunAck = 0;
-    bool grenadeAckKnown = false;
-    int grenadeAck = 0;
-    bool grenadeToggleActive = false;
-    XrPath gunHand = XR_NULL_PATH;
+    std::vector<Grip> grips;
+    std::vector<std::pair<XrSpace, XrPath>> aimSpaces;
+    Pose gun;
+    Pose head;
     uint64_t frame = 0;
-    int loggedSqueezeQueries = 0;
-    int loggedBooleanQueries = 0;
-    int loggedStickQueries = 0;
-    bool loggedFirstSync = false;
-};
 
-LayerState& State()
-{
-    static LayerState state;
-    return state;
-}
-
-std::wstring ModuleDirectory()
-{
-    HMODULE module = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&State), &module);
-    wchar_t path[MAX_PATH] = {};
-    GetModuleFileNameW(module, path, MAX_PATH);
-    std::wstring result = path;
-    size_t slash = result.find_last_of(L"\\/");
-    return slash == std::wstring::npos ? std::wstring() : result.substr(0, slash);
-}
-
-std::wstring ProcessFileName()
-{
-    wchar_t path[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring result = path;
-    size_t slash = result.find_last_of(L"\\/");
-    return slash == std::wstring::npos ? result : result.substr(slash + 1);
-}
-
-std::string NarrowPath(const std::wstring& text)
-{
-    std::string result;
-    for (wchar_t c : text)
-        result += c < 128 ? static_cast<char>(c) : '?';
-    return result;
-}
-
-void InitializeOnce()
-{
-    static std::once_flag once;
-    std::call_once(once, [] {
-        LayerState& s = State();
-        s.directory = ModuleDirectory();
-        s.config = LoadConfig(s.directory + L"\\" + kConfigFileName);
-        std::wstring process = ProcessFileName();
-        s.active = _wcsicmp(process.c_str(), s.config.targetProcess.c_str()) == 0;
-        if (!s.active)
-            return;
-
-        LogOpen(s.directory + L"\\" + kLogFileName);
-        Log("layer active in %s", NarrowPath(process).c_str());
-        Log("config: reload_grab=%d grenade_toggle=%d", s.config.reloadGrabEnabled, s.config.grenadeToggle);
-        Log("config: crouch=%d press_cmd='%s' release_cmd='%s'", s.config.crouchEnabled, s.config.crouchPressCommand.c_str(),
-            s.config.crouchReleaseCommand.c_str());
-        Log("config: crouch mode=%s uncrouch_on_jump=%d jump_delay_ms=%d", s.config.crouchMode.c_str(), s.config.crouchUncrouchOnJump,
-            s.config.crouchJumpDelayMs);
-        Log("config: tactical=%d hand=%s block_in_game=%d press_cmd='%s' release_cmd='%s'", s.config.tacticalEnabled, s.config.tacticalHand.c_str(),
-            s.config.tacticalBlockHandTrigger, s.config.tacticalPressCommand.c_str(), s.config.tacticalReleaseCommand.c_str());
-        Log("config: sprint=%d hand=%s start_below_eyes_cm=%d stop_below_eyes_cm=%d mode=%s stop_method=%s stop_frames=%d", s.config.sprintEnabled,
-            s.config.sprintHand.c_str(), s.config.sprintStartBelowEyesCm, s.config.sprintStopBelowEyesCm, s.config.sprintMode.c_str(),
-            s.config.sprintStopMethod.c_str(), s.config.sprintStopFrames);
-    });
-}
-
-template <typename T>
-bool ResolveNext(LayerState& s, const char* name, T& function)
-{
-    PFN_xrVoidFunction pointer = nullptr;
-    if (XR_FAILED(s.next.getInstanceProcAddr(s.instance, name, &pointer)) || !pointer)
-    {
-        Log("next layer is missing %s", name);
-        return false;
-    }
-    function = reinterpret_cast<T>(pointer);
-    return true;
-}
-
-XrPath ToPath(LayerState& s, const char* text)
-{
-    XrPath path = XR_NULL_PATH;
-    if (XR_FAILED(s.next.stringToPath(s.instance, text, &path)))
-    {
-        Log("xrStringToPath failed for %s", text);
-        return XR_NULL_PATH;
-    }
-    return path;
-}
-
-std::string PathText(LayerState& s, XrPath path)
-{
-    if (path == XR_NULL_PATH)
-        return "(null)";
-    char buffer[XR_MAX_PATH_LENGTH] = {};
-    uint32_t length = 0;
-    if (XR_FAILED(s.next.pathToString(s.instance, path, XR_MAX_PATH_LENGTH, &length, buffer)))
-        return "(invalid)";
-    return buffer;
-}
-
-XrAction CreateLayerAction(LayerState& s, XrActionSet actionSet, const char* name, const char* localizedName, const std::vector<XrPath>& subactionPaths)
-{
-    XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
-    strcpy_s(info.actionName, name);
-    strcpy_s(info.localizedActionName, localizedName);
-    info.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
-    info.countSubactionPaths = static_cast<uint32_t>(subactionPaths.size());
-    info.subactionPaths = subactionPaths.empty() ? nullptr : subactionPaths.data();
-    XrAction action = XR_NULL_HANDLE;
-    XrResult created = s.next.createAction(actionSet, &info, &action);
-    Log("action '%s' created in '%s' (%d)", name, kGameplaySetName, created);
-    return XR_SUCCEEDED(created) ? action : XR_NULL_HANDLE;
-}
-
-GripSlot* FindGrip(LayerState& s, XrPath path)
-{
-    auto it = std::find_if(s.grips.begin(), s.grips.end(), [path](const GripSlot& grip) { return grip.path == path; });
-    return it == s.grips.end() ? nullptr : &*it;
-}
-
-void ConfigureGrips(LayerState& s, const XrActionCreateInfo& info)
-{
-    s.grips.clear();
-    for (uint32_t i = 0; i < info.countSubactionPaths; ++i)
-    {
-        XrPath path = info.subactionPaths[i];
-        bool left = path == s.leftHand;
-        bool right = path == s.rightHand;
-        if (!left && !right)
-            continue;
-        GripSlot grip;
-        grip.path = path;
-        grip.name = left ? "left" : "right";
-        s.grips.push_back(grip);
-    }
-    for (const GripSlot& grip : s.grips)
-        Log("squeeze slot %s path=%s", grip.name, PathText(s, grip.path).c_str());
-}
-
-const char* HandName(const LayerState& s, XrPath hand)
-{
-    return hand == s.leftHand ? "left" : hand == s.rightHand ? "right" : "unknown";
-}
-
-void TrackHeld(GripSlot& grip, float output)
-{
-    bool held = output > kHeldThreshold;
-    if (held && !grip.held)
-        grip.heldAt = std::chrono::steady_clock::now();
-    grip.held = held;
-}
-
-void UpdateReloadState(LayerState& s)
-{
+    GameVar menuVar{"tf2vrbb_menu_active"};
+    GameVar highlightVar{"tf2vr_reload_highlight"};
+    GameVar gunAckVar{"tf2vr_gun_ack"};
+    GameVar grenadeAckVar{"tf2vr_grenade_ack"};
+    GameVar gunGripToggleVar{"tf2vr_toggle_grip"};
+    GameVar titanVar{"tf2vrbb_titan"};
+    int menu = -2;
+    bool titan = false;
     int highlight = 0;
-    if (!s.reloadHighlightVar.ReadInt(highlight))
-        highlight = 0;
-    if (highlight != s.reloadHighlight)
-    {
-        Log("reload highlight %d", highlight);
-        s.reloadHighlight = highlight;
-    }
-    auto now = std::chrono::steady_clock::now();
-    if (highlight != 0)
-        s.reloadSeenAt = now;
-    bool waiting = highlight != 0 || (s.reloadWaiting && now - s.reloadSeenAt < kReloadEndGrace);
-    if (waiting == s.reloadWaiting)
-        return;
-    Log("reload %s", waiting ? "started" : "finished");
-    s.reloadWaiting = waiting;
-}
+    bool reloadWaiting = false;
+    Clock::time_point reloadSeenAt;
+    std::optional<int> gunAck;
+    std::optional<int> grenadeAck;
+    bool grenadeToggle = false;
 
-void UpdateSqueeze(LayerState& s, XrSession session)
-{
-    for (GripSlot& grip : s.grips)
+    Button crouchButton;
+    bool jumpPressed = false;
+    bool crouchInverted = false;
+    bool crouchReleased = false;
+    bool ducked = false;
+    bool jumpPending = false;
+    Clock::time_point jumpReleaseAt;
+    uint64_t jumpTapEnd = 0;
+    bool jumpOverride = false;
+    bool jumpOutput = false;
+    bool jumpChanged = false;
+
+    Button tacticalButton;
+    bool triggerApplies = false;
+    bool triggerBlocked = false;
+    bool triggerReloadBlocked = false;
+    bool triggerWaitRelease = false;
+    float triggerOutput = 0.0f;
+    bool triggerChanged = false;
+    XrTime triggerChangeTime = 0;
+
+    bool lowered = false;
+    bool loggedSpaceMismatch = false;
+    uint64_t stopStart = 0;
+    uint64_t stopEnd = 0;
+    bool sprintPressed = false;
+    bool stickZeroed = false;
+    bool stickChanged = false;
+    bool sprintOutput = false;
+    bool sprintChanged = false;
+    XrTime sprintChangeTime = 0;
+
+    bool Resolve()
+    {
+        auto get = [this](const char* name, auto& function) {
+            PFN_xrVoidFunction pointer = nullptr;
+            if (XR_FAILED(next.getInstanceProcAddr(instance, name, &pointer)) || !pointer)
+            {
+                Log("next layer is missing %s", name);
+                return false;
+            }
+            function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(pointer);
+            return true;
+        };
+        bool resolved = get("xrStringToPath", next.stringToPath) && get("xrCreateActionSet", next.createActionSet) &&
+                        get("xrCreateAction", next.createAction) && get("xrSyncActions", next.syncActions) &&
+                        get("xrGetActionStateFloat", next.getActionStateFloat) && get("xrGetActionStateBoolean", next.getActionStateBoolean) &&
+                        get("xrGetActionStateVector2f", next.getActionStateVector2f) && get("xrCreateActionSpace", next.createActionSpace) &&
+                        get("xrLocateSpace", next.locateSpace) && get("xrLocateViews", next.locateViews);
+        PFN_xrVoidFunction locateSpaces = nullptr;
+        if (resolved && XR_SUCCEEDED(next.getInstanceProcAddr(instance, "xrLocateSpaces", &locateSpaces)))
+            next.locateSpaces = reinterpret_cast<PFN_xrLocateSpaces>(locateSpaces);
+        return resolved;
+    }
+
+    XrPath ToPath(const char* text)
+    {
+        XrPath path = XR_NULL_PATH;
+        next.stringToPath(instance, text, &path);
+        return path;
+    }
+
+    const char* HandName(XrPath hand) const
+    {
+        return hand == left ? "left" : hand == right ? "right" : "unknown";
+    }
+
+    XrAction CreateAction(XrActionSet set, const char* name, const char* localizedName, bool perHand)
+    {
+        XrPath hands[] = {left, right};
+        XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+        strcpy_s(info.actionName, name);
+        strcpy_s(info.localizedActionName, localizedName);
+        info.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+        info.countSubactionPaths = perHand ? 2 : 0;
+        info.subactionPaths = perHand ? hands : nullptr;
+        XrAction action = XR_NULL_HANDLE;
+        XrResult result = next.createAction(set, &info, &action);
+        Log("action '%s' created (%d)", name, result);
+        return XR_SUCCEEDED(result) ? action : XR_NULL_HANDLE;
+    }
+
+    bool ReadBoolean(XrSession session, XrAction action, XrPath hand, XrActionStateBoolean& state)
     {
         XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
-        get.action = s.squeeze;
-        get.subactionPath = grip.path;
-        XrActionStateFloat squeeze{XR_TYPE_ACTION_STATE_FLOAT};
-        bool squeezeActive = XR_SUCCEEDED(s.next.getActionStateFloat(session, &get, &squeeze)) && squeeze.isActive;
-        float raw = squeezeActive ? squeeze.currentState : 0.0f;
+        get.action = action;
+        get.subactionPath = hand;
+        return XR_SUCCEEDED(next.getActionStateBoolean(session, &get, &state));
+    }
 
-        bool grabbing = false;
-        XrTime grabTime = 0;
-        grip.grabBound = false;
-        if (s.reloadGrab != XR_NULL_HANDLE)
+    bool ReadFloat(XrSession session, XrAction action, XrPath hand, XrActionStateFloat& state)
+    {
+        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+        get.action = action;
+        get.subactionPath = hand;
+        return XR_SUCCEEDED(next.getActionStateFloat(session, &get, &state)) && state.isActive;
+    }
+
+    bool UpdateButton(XrSession session, XrAction action, Button& button, const char* label)
+    {
+        button.changed = false;
+        XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+        if (action == XR_NULL_HANDLE || !ReadBoolean(session, action, XR_NULL_PATH, state))
+            return false;
+        button.active = state.isActive;
+        bool pressed = state.isActive && state.currentState;
+        if (pressed != button.pressed)
         {
-            get.action = s.reloadGrab;
-            XrActionStateBoolean grab{XR_TYPE_ACTION_STATE_BOOLEAN};
-            grip.grabBound = XR_SUCCEEDED(s.next.getActionStateBoolean(session, &get, &grab)) && grab.isActive;
-            grabbing = grip.grabBound && grab.currentState;
-            grabTime = grab.lastChangeTime;
+            button.pressed = pressed;
+            button.changed = true;
+            button.changeTime = state.lastChangeTime;
+            Log("%s %s", label, pressed ? "pressed" : "released");
         }
+        return true;
+    }
 
-        auto now = std::chrono::steady_clock::now();
-        bool rawPressed = raw > kHeldThreshold;
-        bool rawEdge = rawPressed && !grip.rawPressed;
-        if (rawEdge)
-            grip.pressAt = now;
-        grip.rawPressed = rawPressed;
+    Grip* FindGrip(XrPath path)
+    {
+        auto it = std::find_if(grips.begin(), grips.end(), [path](const Grip& grip) { return grip.path == path; });
+        return it == grips.end() ? nullptr : &*it;
+    }
 
-        bool routed = grip.grabBound && s.reloadWaiting && grip.path != s.gunHand && !grip.grenadeHeld;
-        if (routed != grip.routed)
-            Log("%s hand: %s", grip.name, routed ? "grip blocked, reload grab active" : "grip restored");
-        grip.routed = routed;
+    Grip* RecentGrab()
+    {
+        Grip* newest = nullptr;
+        for (Grip& grip : grips)
+            if (Clock::now() - grip.heldAt <= kGunGrabWindow && (!newest || grip.heldAt > newest->heldAt))
+                newest = &grip;
+        return newest;
+    }
 
-        float output = raw;
-        if (grip.grenadeHeld)
+    void UpdateMenu()
+    {
+        int value = menuVar.Read().value_or(-1);
+        if (value != menu)
+            Log("menu state: %s", value < 0 ? "unknown (companion script not running)" : value ? "menu or start screen" : "gameplay");
+        menu = value;
+        bool inTitan = titanVar.Read().value_or(0) == 1;
+        if (inTitan != titan)
+            Log("titan %s", inTitan ? "entered, trigger left alone" : "left");
+        titan = inTitan;
+    }
+
+    void UpdateReload()
+    {
+        int value = highlightVar.Read().value_or(0);
+        if (value != highlight)
+            Log("reload highlight %d", value);
+        highlight = value;
+        bool latched = std::any_of(grips.begin(), grips.end(), [](const Grip& grip) { return grip.grabLatched; });
+        if (highlight != 0 || latched)
+            reloadSeenAt = Clock::now();
+        bool waiting = highlight != 0 || latched || (reloadWaiting && Clock::now() - reloadSeenAt < kReloadEndGrace);
+        if (waiting != reloadWaiting)
+            Log("reload %s", waiting ? "started" : "finished");
+        reloadWaiting = waiting;
+    }
+
+    void UpdateSqueeze(XrSession session)
+    {
+        for (Grip& grip : grips)
         {
-            output = rawEdge ? 0.0f : 1.0f;
+            XrActionStateFloat squeezeState{XR_TYPE_ACTION_STATE_FLOAT};
+            float raw = ReadFloat(session, squeeze, grip.path, squeezeState) ? squeezeState.currentState : 0.0f;
+            XrActionStateBoolean grab{XR_TYPE_ACTION_STATE_BOOLEAN};
+            grip.grabBound = reloadGrab != XR_NULL_HANDLE && ReadBoolean(session, reloadGrab, grip.path, grab) && grab.isActive;
+            bool grabbing = grip.grabBound && grab.currentState;
+
+            auto now = Clock::now();
+            bool rawPressed = raw > kHeld;
+            bool rawEdge = rawPressed && !grip.rawPressed;
             if (rawEdge)
+                grip.pressAt = now;
+            if (rawPressed != grip.rawPressed)
+                Log("%s hand: grip %s", grip.name, rawPressed ? "pressed" : "released");
+            grip.rawPressed = rawPressed;
+            if (grabbing != grip.grabPressed)
+                Log("%s hand: reload grab %s", grip.name, grabbing ? "pressed" : "released");
+            grip.grabPressed = grabbing;
+
+            bool routed = grip.grabBound && reloadWaiting && grip.path != gunHand && !grip.grenadeHeld;
+            if (routed != grip.routed)
+                Log("%s hand: %s", grip.name, routed ? "grip blocked, reload grab active" : "grip restored");
+            grip.routed = routed;
+            bool latched = routed && grabbing;
+            if (latched != grip.grabLatched)
+                Log("%s hand: %s", grip.name, latched ? "reload grab holds" : "reload grab let go");
+            grip.grabLatched = latched;
+
+            float output = raw;
+            if (grip.grenadeHeld)
             {
+                output = rawEdge ? 0.0f : 1.0f;
+                if (rawEdge)
+                {
+                    grip.grenadeHeld = false;
+                    grip.waitRelease = true;
+                    Log("%s hand: grenade let go", grip.name);
+                }
+            }
+            else if (grip.waitRelease)
+            {
+                output = 0.0f;
+                grip.waitRelease = rawPressed;
+            }
+            else if (routed)
+                output = grabbing ? 1.0f : 0.0f;
+            else if (grenadeToggle && !rawPressed && grip.output > kHeld && now - grip.pressAt < kGrenadeMinPress)
+                output = grip.output;
+
+            grip.changed = output != grip.output;
+            grip.sampled = routed || grip.changed || output != raw;
+            if (grip.changed)
+                grip.changeTime = routed ? grab.lastChangeTime : squeezeState.lastChangeTime;
+            grip.output = output;
+            bool held = output > kHeld;
+            if (held && !grip.held)
+                grip.heldAt = now;
+            grip.held = held;
+        }
+    }
+
+    void UpdateGunHand()
+    {
+        if (!NewPositive(gunAck, gunAckVar.Read()))
+            return;
+        Grip* newest = RecentGrab();
+        if (!newest)
+        {
+            Log("gun ack %d: no recent grab, gun hand stays %s", *gunAck, HandName(gunHand));
+            return;
+        }
+        gunHand = newest->path;
+        Log("gun ack %d: gun hand %s", *gunAck, newest->name);
+    }
+
+    void UpdateGrenade(bool enabled)
+    {
+        bool active = enabled && gunGripToggleVar.Read().value_or(0) == 1;
+        if (active != grenadeToggle)
+            Log("grenade toggle %s", active ? "on (Gun Grip is Toggle)" : "off");
+        grenadeToggle = active;
+        if (!active || menu != 0)
+        {
+            for (Grip& grip : grips)
+            {
+                if (grip.grenadeHeld)
+                    Log("%s hand: grenade toggle cleared", grip.name);
                 grip.grenadeHeld = false;
-                grip.waitRelease = true;
-                Log("%s hand: grenade let go", grip.name);
             }
         }
-        else if (grip.waitRelease)
-        {
-            output = 0.0f;
-            if (!rawPressed)
-                grip.waitRelease = false;
-        }
-        else if (routed)
-        {
-            output = grabbing ? 1.0f : 0.0f;
-        }
-        else if (s.grenadeToggleActive && !rawPressed && grip.output > kHeldThreshold && now - grip.pressAt < kGrenadeMinPress)
-        {
-            output = grip.output;
-        }
-        grip.changed = output != grip.output;
-        grip.sampled = routed || grip.changed || output != raw;
-        if (grip.changed)
-            grip.changeTime = routed ? grabTime : squeeze.lastChangeTime;
-        grip.output = output;
-        TrackHeld(grip, output);
-    }
-}
 
-const GripSlot* RecentGrab(const LayerState& s)
-{
-    auto now = std::chrono::steady_clock::now();
-    const GripSlot* newest = nullptr;
-    for (const GripSlot& grip : s.grips)
-        if (now - grip.heldAt <= kGunGrabWindow && (!newest || grip.heldAt > newest->heldAt))
-            newest = &grip;
-    return newest;
-}
-
-void UpdateGrenade(LayerState& s)
-{
-    int toggle = 0;
-    if (!s.gunGripToggleVar.ReadInt(toggle))
-        toggle = 0;
-    bool active = s.config.grenadeToggle && toggle == 1;
-    if (active != s.grenadeToggleActive)
-        Log("grenade toggle %s", active ? "on (Gun Grip is Toggle)" : "off");
-    s.grenadeToggleActive = active;
-
-    if (!active || s.menuState != 0)
-    {
-        for (GripSlot& grip : s.grips)
-        {
-            if (grip.grenadeHeld)
-                Log("%s hand: grenade toggle cleared", grip.name);
-            grip.grenadeHeld = false;
-        }
-    }
-
-    int ack = 0;
-    if (!s.grenadeAckVar.ReadInt(ack))
-        return;
-    if (!s.grenadeAckKnown)
-    {
-        s.grenadeAckKnown = true;
-        s.grenadeAck = ack;
-        return;
-    }
-    if (ack == s.grenadeAck)
-        return;
-    s.grenadeAck = ack;
-    if (ack <= 0 || !active)
-        return;
-
-    const GripSlot* recent = RecentGrab(s);
-    if (!recent)
-    {
-        Log("grenade ack %d: no recent grab", ack);
-        return;
-    }
-    GripSlot& grip = *std::find_if(s.grips.begin(), s.grips.end(), [recent](const GripSlot& g) { return &g == recent; });
-    if (grip.output <= kHeldThreshold)
-    {
-        Log("grenade ack %d: %s hand already let go", ack, grip.name);
-        return;
-    }
-    grip.grenadeHeld = true;
-    Log("grenade ack %d: %s hand holds the grenade until the next grip press", ack, grip.name);
-}
-
-void UpdateGunHand(LayerState& s)
-{
-    int ack = 0;
-    if (!s.gunAckVar.ReadInt(ack))
-        return;
-    if (!s.gunAckKnown)
-    {
-        s.gunAckKnown = true;
-        s.gunAck = ack;
-        return;
-    }
-    if (ack == s.gunAck)
-        return;
-    s.gunAck = ack;
-    if (ack <= 0)
-        return;
-
-    const GripSlot* newest = RecentGrab(s);
-    if (!newest)
-    {
-        Log("gun ack %d: no recent grab, gun hand stays %s", ack, HandName(s, s.gunHand));
-        return;
-    }
-    s.gunHand = newest->path;
-    Log("gun ack %d: gun hand %s", ack, newest->name);
-}
-
-void UpdateCommandAction(LayerState& s, XrSession session, XrAction action, ButtonState& button, const char* label, const std::string& pressCommand,
-                         const std::string& releaseCommand, std::vector<std::string>& commands)
-{
-    button.changed = false;
-    if (action == XR_NULL_HANDLE)
-        return;
-    XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
-    get.action = action;
-    XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
-    if (XR_FAILED(s.next.getActionStateBoolean(session, &get, &state)))
-        return;
-
-    button.active = state.isActive == XR_TRUE;
-    bool pressed = state.isActive && state.currentState == XR_TRUE;
-    if (pressed == button.pressed)
-        return;
-    button.pressed = pressed;
-    button.changed = true;
-    button.changeTime = state.lastChangeTime;
-    Log("%s %s", label, pressed ? "pressed" : "released");
-    const std::string& command = pressed ? pressCommand : releaseCommand;
-    if (!command.empty())
-        commands.push_back(command);
-}
-
-void UpdateCrouch(LayerState& s, XrSession session, std::vector<std::string>& commands)
-{
-    ButtonState& button = s.crouchButton;
-    CrouchState& c = s.crouchState;
-    button.changed = false;
-    if (s.crouch == XR_NULL_HANDLE)
-        return;
-    XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
-    get.action = s.crouch;
-    XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
-    if (XR_FAILED(s.next.getActionStateBoolean(session, &get, &state)))
-        return;
-    button.active = state.isActive == XR_TRUE;
-    bool pressed = state.isActive && state.currentState == XR_TRUE;
-    if (pressed != button.pressed)
-    {
-        button.pressed = pressed;
-        button.changed = true;
-        button.changeTime = state.lastChangeTime;
-        Log("crouch %s", pressed ? "pressed" : "released");
-    }
-
-    bool jumpEdge = false;
-    bool jumpPressed = false;
-    if (s.jump != XR_NULL_HANDLE && s.jumpHand != XR_NULL_PATH)
-    {
-        get.action = s.jump;
-        get.subactionPath = s.jumpHand;
-        XrActionStateBoolean jump{XR_TYPE_ACTION_STATE_BOOLEAN};
-        jumpPressed = XR_SUCCEEDED(s.next.getActionStateBoolean(session, &get, &jump)) && jump.isActive && jump.currentState;
-        jumpEdge = jumpPressed && !c.jumpPressed;
-        c.jumpPressed = jumpPressed;
-    }
-
-    bool buttonMode = s.config.crouchMode == "button";
-    if (buttonMode && !pressed)
-        c.released = false;
-    bool ducked = buttonMode ? pressed && !c.released : pressed != c.inverted;
-    if (jumpEdge && ducked && s.config.crouchUncrouchOnJump)
-    {
-        if (buttonMode)
-            c.released = true;
+        if (!NewPositive(grenadeAck, grenadeAckVar.Read()) || !active)
+            return;
+        Grip* grip = RecentGrab();
+        if (!grip)
+            Log("grenade ack %d: no recent grab", *grenadeAck);
+        else if (grip->output <= kHeld)
+            Log("grenade ack %d: %s hand already let go", *grenadeAck, grip->name);
         else
-            c.inverted = pressed;
-        ducked = false;
-        c.jumpPending = true;
-        c.jumpReleaseAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(s.config.crouchJumpDelayMs, 0));
-        Log("crouch released by jump, jump held back %d ms", s.config.crouchJumpDelayMs);
-    }
-    if (c.jumpPending && std::chrono::steady_clock::now() >= c.jumpReleaseAt)
-    {
-        c.jumpPending = false;
-        if (!jumpPressed)
-            c.jumpPulseEnd = s.frame + kJumpPulseFrames;
-        Log("jump passed on%s", jumpPressed ? "" : " as a tap");
-    }
-    bool pulsing = s.frame < c.jumpPulseEnd;
-    bool jumpOutput = c.jumpPending ? false : jumpPressed || pulsing;
-    c.jumpChanged = jumpOutput != c.jumpOutput;
-    c.jumpOutput = jumpOutput;
-    c.jumpOverride = c.jumpPending || pulsing;
-    if (ducked == c.ducked)
-        return;
-    c.ducked = ducked;
-    const std::string& command = ducked ? s.config.crouchPressCommand : s.config.crouchReleaseCommand;
-    if (!command.empty())
-        commands.push_back(command);
-}
-
-void UpdateMenuState(LayerState& s)
-{
-    int menu = -1;
-    if (!s.menuActiveVar.ReadInt(menu))
-        menu = -1;
-    if (menu != s.menuState)
-    {
-        Log("menu state: %s", menu < 0 ? "unknown (companion script not running)" : menu ? "menu or start screen" : "gameplay");
-        s.menuState = menu;
-    }
-    int phase = -1;
-    if (!s.startupPhaseVar.ReadInt(phase))
-        phase = -1;
-    if (phase != s.startupPhase)
-    {
-        Log("startup phase: %d", phase);
-        s.startupPhase = phase;
-    }
-}
-
-void UpdateTacticalHand(LayerState& s)
-{
-    if (s.config.tacticalHand != "auto")
-        return;
-    XrPath support = s.gunHand == s.leftHand ? s.rightHand : s.leftHand;
-    if (support == s.tacticalHand)
-        return;
-    s.tacticalHand = support;
-    s.triggerOverride.applies = false;
-    s.triggerOverride.blocked = false;
-    Log("tactical hand %s (support hand)", HandName(s, support));
-}
-
-void UpdateTriggerOverride(LayerState& s, XrSession session)
-{
-    TriggerOverride& o = s.triggerOverride;
-    o.changed = false;
-    if (s.trigger == XR_NULL_HANDLE || s.tacticalHand == XR_NULL_PATH)
-    {
-        o.applies = false;
-        return;
-    }
-
-    XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
-    get.action = s.trigger;
-    get.subactionPath = s.tacticalHand;
-    XrActionStateFloat raw{XR_TYPE_ACTION_STATE_FLOAT};
-    bool rawActive = XR_SUCCEEDED(s.next.getActionStateFloat(session, &get, &raw)) && raw.isActive;
-    bool rawPressed = rawActive && raw.currentState > kHeldThreshold;
-
-    const GripSlot* support = FindGrip(s, s.tacticalHand);
-    bool reloadBlock = s.menuState == 0 && s.reloadWaiting && support && support->grabBound;
-    if (o.reloadBlocked && !reloadBlock && !s.reloadWaiting && rawPressed && !o.waitRelease)
-    {
-        o.waitRelease = true;
-        Log("%s trigger held back until released", HandName(s, s.tacticalHand));
-    }
-    if (o.waitRelease && !rawPressed)
-        o.waitRelease = false;
-    if (reloadBlock != o.reloadBlocked)
-        Log("%s trigger %s", HandName(s, s.tacticalHand), reloadBlock ? "blocked (reload)" : "no longer blocked by the reload");
-    o.reloadBlocked = reloadBlock;
-
-    bool tacticalBound = s.tacticalButton.active;
-    if (!tacticalBound && !reloadBlock && !o.waitRelease)
-    {
-        o.applies = false;
-        return;
-    }
-
-    if (tacticalBound)
-    {
-        bool tacticalBlock = s.config.tacticalBlockHandTrigger && s.menuState == 0;
-        if (tacticalBlock != o.blocked)
-            Log("%s trigger %s", HandName(s, s.tacticalHand), tacticalBlock ? "blocked (gameplay, tactical bound)" : "passes through");
-        o.blocked = tacticalBlock;
-    }
-    bool blocked = (tacticalBound && o.blocked) || reloadBlock || o.waitRelease;
-
-    float output = std::max(s.tacticalButton.pressed ? 1.0f : 0.0f, rawActive && !blocked ? raw.currentState : 0.0f);
-    o.changed = !o.applies || output != o.output;
-    if (o.changed)
-        o.changeTime = s.tacticalButton.changed || !rawActive ? s.tacticalButton.changeTime : raw.lastChangeTime;
-    if (s.tacticalButton.changed)
-        Log("tactical drives %s trigger = %.1f", HandName(s, s.tacticalHand), output);
-    o.output = output;
-    o.applies = true;
-}
-
-float PitchDegrees(const XrQuaternionf& q)
-{
-    float forwardUp = 2.0f * (q.w * q.x - q.y * q.z);
-    return std::asin(std::clamp(forwardUp, -1.0f, 1.0f)) * 57.29578f;
-}
-
-const char* ReferenceSpaceName(const LayerState& s, XrSpace space)
-{
-    for (const auto& [handle, type] : s.referenceSpaces)
-    {
-        if (handle != space)
-            continue;
-        switch (type)
         {
-        case XR_REFERENCE_SPACE_TYPE_VIEW: return "view";
-        case XR_REFERENCE_SPACE_TYPE_LOCAL: return "local";
-        case XR_REFERENCE_SPACE_TYPE_STAGE: return "stage";
-        default: return "other reference";
+            grip->grenadeHeld = true;
+            Log("grenade ack %d: %s hand holds the grenade until the next grip press", *grenadeAck, grip->name);
         }
     }
-    return "non-reference";
-}
 
-void RecordAimPose(LayerState& s, XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocationFlags flags, const XrPosef& pose)
+    void UpdateCrouch(XrSession session, const Config& config, std::vector<const char*>& commands)
+    {
+        if (!UpdateButton(session, crouch, crouchButton, "crouch"))
+            return;
+        bool pressed = crouchButton.pressed;
+
+        bool jumpNow = false;
+        bool jumpEdge = false;
+        if (jump != XR_NULL_HANDLE)
+        {
+            XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+            jumpNow = ReadBoolean(session, jump, right, state) && state.isActive && state.currentState;
+            jumpEdge = jumpNow && !jumpPressed;
+            jumpPressed = jumpNow;
+        }
+
+        if (config.crouchButtonMode && !pressed)
+            crouchReleased = false;
+        bool duck = config.crouchButtonMode ? pressed && !crouchReleased : pressed != crouchInverted;
+        if (jumpEdge && duck && config.uncrouchOnJump)
+        {
+            if (config.crouchButtonMode)
+                crouchReleased = true;
+            else
+                crouchInverted = pressed;
+            duck = false;
+            jumpPending = true;
+            jumpReleaseAt = Clock::now() + std::chrono::milliseconds(config.jumpDelayMs);
+            Log("crouch released by jump, jump held back %d ms", config.jumpDelayMs);
+        }
+        if (jumpPending && Clock::now() >= jumpReleaseAt)
+        {
+            jumpPending = false;
+            if (!jumpNow)
+                jumpTapEnd = frame + kJumpTapFrames;
+            Log("jump passed on%s", jumpNow ? "" : " as a tap");
+        }
+        bool tapping = frame < jumpTapEnd;
+        bool output = !jumpPending && (jumpNow || tapping);
+        jumpChanged = output != jumpOutput;
+        jumpOutput = output;
+        jumpOverride = jumpPending || tapping;
+        if (duck != ducked)
+            commands.push_back(duck ? "+duck" : "-duck");
+        ducked = duck;
+    }
+
+    void UpdateTacticalHand()
+    {
+        XrPath support = gunHand == left ? right : left;
+        if (support == tacticalHand)
+            return;
+        tacticalHand = support;
+        triggerApplies = false;
+        triggerBlocked = false;
+        Log("tactical hand %s (support hand)", HandName(support));
+    }
+
+    void UpdateTrigger(XrSession session, const Config& config)
+    {
+        triggerChanged = false;
+        if (trigger == XR_NULL_HANDLE || titan)
+        {
+            triggerApplies = false;
+            return;
+        }
+        XrActionStateFloat raw{XR_TYPE_ACTION_STATE_FLOAT};
+        bool rawActive = ReadFloat(session, trigger, tacticalHand, raw);
+        bool rawPressed = rawActive && raw.currentState > kHeld;
+
+        const Grip* support = FindGrip(tacticalHand);
+        bool reloadBlock = menu == 0 && reloadWaiting && support && support->grabBound;
+        if (triggerReloadBlocked && !reloadBlock && !reloadWaiting && rawPressed && !triggerWaitRelease)
+        {
+            triggerWaitRelease = true;
+            Log("%s trigger held back until released", HandName(tacticalHand));
+        }
+        triggerWaitRelease = triggerWaitRelease && rawPressed;
+        if (reloadBlock != triggerReloadBlocked)
+            Log("%s trigger %s", HandName(tacticalHand), reloadBlock ? "blocked (reload)" : "no longer blocked by the reload");
+        triggerReloadBlocked = reloadBlock;
+
+        bool tacticalBound = tacticalButton.active;
+        if (!tacticalBound && !reloadBlock && !triggerWaitRelease)
+        {
+            triggerApplies = false;
+            return;
+        }
+        if (tacticalBound)
+        {
+            bool block = config.blockTrigger && menu == 0;
+            if (block != triggerBlocked)
+                Log("%s trigger %s", HandName(tacticalHand), block ? "blocked (gameplay, tactical bound)" : "passes through");
+            triggerBlocked = block;
+        }
+        bool blocked = (tacticalBound && triggerBlocked) || reloadBlock || triggerWaitRelease;
+        float output = std::max(tacticalButton.pressed ? 1.0f : 0.0f, rawActive && !blocked ? raw.currentState : 0.0f);
+        triggerChanged = !triggerApplies || output != triggerOutput;
+        if (triggerChanged)
+            triggerChangeTime = tacticalButton.changed || !rawActive ? tacticalButton.changeTime : raw.lastChangeTime;
+        if (tacticalButton.changed)
+            Log("tactical drives %s trigger = %.1f", HandName(tacticalHand), output);
+        triggerOutput = output;
+        triggerApplies = true;
+    }
+
+    void RecordAim(XrSpace space, XrSpace base, XrTime time, XrSpaceLocationFlags flags, const XrPosef& pose)
+    {
+        constexpr XrSpaceLocationFlags valid = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+        auto it = std::find_if(aimSpaces.begin(), aimSpaces.end(), [space](const auto& aimSpace) { return aimSpace.first == space; });
+        if (it == aimSpaces.end() || it->second != gunHand || (flags & valid) != valid || time < gun.time)
+            return;
+        gun = {true, pose.position.y, base, time};
+    }
+
+    void RecordHead(XrSpace base, XrTime time, const XrView* views, uint32_t count)
+    {
+        if (count == 0 || time < head.time)
+            return;
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < count; ++i)
+            sum += views[i].pose.position.y;
+        head = {true, sum / static_cast<float>(count), base, time};
+    }
+
+    void UpdateSprint(XrSession session, const Config& config)
+    {
+        sprintChanged = false;
+        if (stickClick == XR_NULL_HANDLE)
+            return;
+
+        bool sameBase = gun.base == head.base;
+        if (gun.valid && head.valid && !sameBase && !loggedSpaceMismatch)
+        {
+            loggedSpaceMismatch = true;
+            Log("gun and head are located in different spaces, sprint disabled");
+        }
+        bool measured = gun.valid && head.valid && sameBase;
+        float belowEyes = measured ? (head.height - gun.height) * 100.0f : 0.0f;
+        bool nowLowered = measured && (lowered ? belowEyes >= static_cast<float>(config.sprintStopCm) : belowEyes > static_cast<float>(config.sprintStartCm));
+        if (nowLowered != lowered)
+            Log("gun %s: %.0f cm below eyes", nowLowered ? "lowered" : "raised", belowEyes);
+        if (nowLowered)
+            stopStart = stopEnd = 0;
+        else if (lowered && measured && menu == 0 && !reloadWaiting)
+        {
+            stopStart = frame + kSprintStopGapFrames;
+            stopEnd = stopStart + kSprintStopFrames;
+            Log("sprint stop by stick");
+        }
+        lowered = nowLowered;
+        bool stopping = stopEnd != 0 && frame >= stopStart && frame < stopEnd;
+        if (stopEnd != 0 && frame >= stopEnd)
+            stopStart = stopEnd = 0;
+
+        bool pressed = lowered && menu == 0 && !reloadWaiting;
+        stickChanged = stopping != stickZeroed;
+        stickZeroed = stopping;
+        if (pressed != sprintPressed)
+            Log("sprint %s", pressed ? "pressed" : "released");
+        sprintPressed = pressed;
+
+        XrActionStateBoolean raw{XR_TYPE_ACTION_STATE_BOOLEAN};
+        bool rawPressed = ReadBoolean(session, stickClick, left, raw) && raw.isActive && raw.currentState;
+        bool output = rawPressed || pressed;
+        sprintChanged = output != sprintOutput;
+        if (sprintChanged)
+            sprintChangeTime = rawPressed != sprintOutput && raw.lastChangeTime != 0 ? raw.lastChangeTime : gun.time;
+        sprintOutput = output;
+    }
+
+    void Sync(XrSession session, const Config& config, std::vector<const char*>& commands)
+    {
+        ++frame;
+        UpdateMenu();
+        UpdateReload();
+        if (squeeze != XR_NULL_HANDLE)
+        {
+            UpdateSqueeze(session);
+            UpdateGunHand();
+            UpdateGrenade(config.grenadeToggle);
+        }
+        UpdateCrouch(session, config, commands);
+        UpdateButton(session, tactical, tacticalButton, "tactical");
+        UpdateTacticalHand();
+        UpdateTrigger(session, config);
+        UpdateSprint(session, config);
+    }
+};
+
+std::mutex g_mutex;
+bool g_active = false;
+Config g_config;
+Layer g_layer;
+
+XrResult XRAPI_CALL HookCreateActionSet(XrInstance instance, const XrActionSetCreateInfo* info, XrActionSet* set)
 {
-    auto it = std::find_if(s.aimSpaces.begin(), s.aimSpaces.end(), [space](const AimSpace& aim) { return aim.space == space; });
-    if (it == s.aimSpaces.end())
-        return;
-    if (!s.loggedAimLocate)
-    {
-        s.loggedAimLocate = true;
-        Log("app locates aim %s relative to %s space", HandName(s, it->hand), ReferenceSpaceName(s, baseSpace));
-    }
-    XrSpaceLocationFlags needed = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
-    if (it->hand != s.gunHand || (flags & needed) != needed || time < s.gunPoseTime)
-        return;
-    s.gunPitch = PitchDegrees(pose.orientation);
-    s.gunHeight = pose.position.y;
-    s.gunPoseBase = baseSpace;
-    s.gunPoseTime = time;
-    s.gunPoseValid = true;
-}
-
-void RecordHead(LayerState& s, XrSpace baseSpace, XrTime time, const XrView* views, uint32_t count)
-{
-    if (count == 0 || time < s.headTime)
-        return;
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < count; ++i)
-        sum += views[i].pose.position.y;
-    s.headHeight = sum / static_cast<float>(count);
-    s.headBase = baseSpace;
-    s.headTime = time;
-    s.headValid = true;
-}
-
-void UpdateSprint(LayerState& s, XrSession session)
-{
-    SprintState& sprint = s.sprint;
-    sprint.changed = false;
-    if (s.stickClick == XR_NULL_HANDLE || s.sprintHand == XR_NULL_PATH)
-        return;
-
-    bool sameBase = s.gunPoseBase == s.headBase;
-    if (s.gunPoseValid && s.headValid && !sameBase && !s.loggedBaseMismatch)
-    {
-        s.loggedBaseMismatch = true;
-        Log("gun and head are located in different spaces (%s, %s), sprint disabled", ReferenceSpaceName(s, s.gunPoseBase), ReferenceSpaceName(s, s.headBase));
-    }
-    bool measured = s.gunPoseValid && s.headValid && sameBase;
-    float belowEyes = measured ? (s.headHeight - s.gunHeight) * 100.0f : 0.0f;
-    bool lowered = sprint.lowered;
-    if (!measured)
-        lowered = false;
-    else if (!lowered && belowEyes > static_cast<float>(s.config.sprintStartBelowEyesCm))
-        lowered = true;
-    else if (lowered && belowEyes < static_cast<float>(s.config.sprintStopBelowEyesCm))
-        lowered = false;
-    if (lowered != sprint.lowered)
-        Log("gun %s: %.0f cm below eyes, pitch %.0f degrees", lowered ? "lowered" : "raised", belowEyes, s.gunPitch);
-    bool stopMethod = s.config.sprintStopMethod == "stick";
-    if (lowered)
-    {
-        sprint.stopStart = 0;
-        sprint.stopEnd = 0;
-    }
-    else if (sprint.lowered && measured && stopMethod && s.menuState == 0 && !s.reloadWaiting)
-    {
-        sprint.stopStart = s.frame + kSprintStopGapFrames;
-        sprint.stopEnd = sprint.stopStart + static_cast<uint64_t>(std::max(s.config.sprintStopFrames, 1));
-        Log("sprint stop by %s", s.config.sprintStopMethod.c_str());
-    }
-    sprint.lowered = lowered;
-    bool stopping = sprint.stopEnd != 0 && s.frame >= sprint.stopStart && s.frame < sprint.stopEnd;
-    if (sprint.stopEnd != 0 && s.frame >= sprint.stopEnd)
-    {
-        sprint.stopStart = 0;
-        sprint.stopEnd = 0;
-    }
-    if (measured && s.frame >= s.gunPoseLoggedFrame + kPitchLogFrames)
-    {
-        s.gunPoseLoggedFrame = s.frame;
-        Log("gun %.0f cm below eyes, pitch %.0f degrees (%s hand)", belowEyes, s.gunPitch, HandName(s, s.gunHand));
-    }
-
-    bool wanted = lowered && s.menuState == 0 && !s.reloadWaiting;
-    bool pressed = false;
-    if (s.config.sprintMode == "pulse")
-    {
-        if (!wanted)
-            sprint.pulseEnd = 0;
-        else if (sprint.pulseEnd == 0)
-            sprint.pulseEnd = s.frame + kSprintPulseFrames;
-        pressed = sprint.pulseEnd != 0 && s.frame < sprint.pulseEnd;
-    }
-    else
-    {
-        pressed = wanted;
-    }
-    bool stickZeroed = stopping && s.config.sprintStopMethod == "stick";
-    sprint.stickChanged = stickZeroed != sprint.stickZeroed;
-    sprint.stickZeroed = stickZeroed;
-    if (pressed != sprint.pressed)
-        Log("sprint %s", pressed ? "pressed" : "released");
-    sprint.pressed = pressed;
-
-    XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
-    get.action = s.stickClick;
-    get.subactionPath = s.sprintHand;
-    XrActionStateBoolean raw{XR_TYPE_ACTION_STATE_BOOLEAN};
-    bool rawPressed = XR_SUCCEEDED(s.next.getActionStateBoolean(session, &get, &raw)) && raw.isActive && raw.currentState;
-    bool output = rawPressed || pressed;
-    sprint.changed = output != sprint.output;
-    if (sprint.changed)
-        sprint.changeTime = rawPressed != sprint.output && raw.lastChangeTime != 0 ? raw.lastChangeTime : s.gunPoseTime;
-    sprint.output = output;
-}
-
-XrResult XRAPI_CALL LayerGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function);
-
-XrResult XRAPI_CALL HookDestroyInstance(XrInstance instance)
-{
-    LayerState& s = State();
-    XrResult result = s.next.destroyInstance(instance);
-    std::lock_guard lock(s.mutex);
-    s.squeeze = XR_NULL_HANDLE;
-    s.trigger = XR_NULL_HANDLE;
-    s.reloadGrab = XR_NULL_HANDLE;
-    s.crouch = XR_NULL_HANDLE;
-    s.tactical = XR_NULL_HANDLE;
-    s.grips.clear();
-    s.crouchButton = {};
-    s.tacticalButton = {};
-    s.triggerOverride = {};
-    s.aim = XR_NULL_HANDLE;
-    s.stickClick = XR_NULL_HANDLE;
-    s.stick = XR_NULL_HANDLE;
-    s.jump = XR_NULL_HANDLE;
-    s.crouchState = {};
-    s.aimSpaces.clear();
-    s.referenceSpaces.clear();
-    s.gunPoseValid = false;
-    s.gunPoseTime = 0;
-    s.headValid = false;
-    s.headTime = 0;
-    s.sprint = {};
-    s.instance = XR_NULL_HANDLE;
-    Log("instance destroyed (%d)", result);
+    XrResult result = g_layer.next.createActionSet(instance, info, set);
+    if (XR_FAILED(result) || !info || std::strcmp(info->actionSetName, "gameplay") != 0)
+        return result;
+    std::lock_guard lock(g_mutex);
+    g_layer.tactical = g_layer.CreateAction(*set, "tf2vr_tactical", "Tactical Ability (Cloak)", false);
+    g_layer.crouch = g_layer.CreateAction(*set, "tf2vr_crouch", "Crouch", false);
+    if (g_config.reloadGrab)
+        g_layer.reloadGrab = g_layer.CreateAction(*set, "tf2vr_reload_grab", "Reload Grab", true);
     return result;
 }
 
-XrResult XRAPI_CALL HookCreateActionSet(XrInstance instance, const XrActionSetCreateInfo* createInfo, XrActionSet* actionSet)
+XrResult XRAPI_CALL HookCreateAction(XrActionSet set, const XrActionCreateInfo* info, XrAction* action)
 {
-    LayerState& s = State();
-    XrResult result = s.next.createActionSet(instance, createInfo, actionSet);
-    if (XR_FAILED(result) || !createInfo)
+    XrResult result = g_layer.next.createAction(set, info, action);
+    if (XR_FAILED(result) || !info)
         return result;
-
-    Log("action set '%s' created", createInfo->actionSetName);
-    if (std::strcmp(createInfo->actionSetName, kGameplaySetName) != 0)
-        return result;
-
-    XrAction tactical = s.config.tacticalEnabled ? CreateLayerAction(s, *actionSet, kTacticalActionName, kTacticalLocalizedName, {}) : XR_NULL_HANDLE;
-    XrAction crouch = s.config.crouchEnabled ? CreateLayerAction(s, *actionSet, kCrouchActionName, kCrouchLocalizedName, {}) : XR_NULL_HANDLE;
-    XrAction reloadGrab =
-        s.config.reloadGrabEnabled ? CreateLayerAction(s, *actionSet, kReloadGrabActionName, kReloadGrabLocalizedName, {s.leftHand, s.rightHand}) : XR_NULL_HANDLE;
-
-    std::lock_guard lock(s.mutex);
-    s.tactical = tactical;
-    s.crouch = crouch;
-    s.reloadGrab = reloadGrab;
-    s.tacticalButton = {};
-    s.crouchButton = {};
-    return result;
-}
-
-XrResult XRAPI_CALL HookCreateAction(XrActionSet actionSet, const XrActionCreateInfo* createInfo, XrAction* action)
-{
-    LayerState& s = State();
-    XrResult result = s.next.createAction(actionSet, createInfo, action);
-    if (XR_FAILED(result) || !createInfo)
-        return result;
-
-    Log("action '%s' type %d subaction paths %u", createInfo->actionName, createInfo->actionType, createInfo->countSubactionPaths);
-    std::lock_guard lock(s.mutex);
-    if (createInfo->actionType == XR_ACTION_TYPE_POSE_INPUT && std::strcmp(createInfo->actionName, kAimActionName) == 0)
-        s.aim = *action;
-    else if (createInfo->actionType == XR_ACTION_TYPE_BOOLEAN_INPUT && std::strcmp(createInfo->actionName, kJumpActionName) == 0)
-        s.jump = *action;
-    else if (createInfo->actionType == XR_ACTION_TYPE_VECTOR2F_INPUT && std::strcmp(createInfo->actionName, kStickActionName) == 0 && s.config.sprintEnabled)
-        s.stick = *action;
-    else if (createInfo->actionType == XR_ACTION_TYPE_BOOLEAN_INPUT && std::strcmp(createInfo->actionName, kStickClickActionName) == 0 && s.config.sprintEnabled)
-        s.stickClick = *action;
-    if (createInfo->actionType != XR_ACTION_TYPE_FLOAT_INPUT)
-        return result;
-
-    if (std::strcmp(createInfo->actionName, kTriggerActionName) == 0)
+    Log("action '%s' type %d subaction paths %u", info->actionName, info->actionType, info->countSubactionPaths);
+    auto is = [info](XrActionType type, const char* name) { return info->actionType == type && std::strcmp(info->actionName, name) == 0; };
+    std::lock_guard lock(g_mutex);
+    Layer& l = g_layer;
+    if (is(XR_ACTION_TYPE_POSE_INPUT, "aim"))
+        l.aim = *action;
+    else if (is(XR_ACTION_TYPE_BOOLEAN_INPUT, "primary"))
+        l.jump = *action;
+    else if (g_config.sprint && is(XR_ACTION_TYPE_VECTOR2F_INPUT, "stick"))
+        l.stick = *action;
+    else if (g_config.sprint && is(XR_ACTION_TYPE_BOOLEAN_INPUT, "stick_click"))
+        l.stickClick = *action;
+    else if (is(XR_ACTION_TYPE_FLOAT_INPUT, "trigger"))
+        l.trigger = *action;
+    else if (is(XR_ACTION_TYPE_FLOAT_INPUT, "squeeze"))
     {
-        s.trigger = *action;
-    }
-    else if (std::strcmp(createInfo->actionName, kSqueezeActionName) == 0)
-    {
-        s.squeeze = *action;
-        ConfigureGrips(s, *createInfo);
+        l.squeeze = *action;
+        l.grips.clear();
+        for (uint32_t i = 0; i < info->countSubactionPaths; ++i)
+        {
+            XrPath path = info->subactionPaths[i];
+            if (path == l.left || path == l.right)
+                l.grips.push_back({path, l.HandName(path)});
+        }
     }
     return result;
 }
 
-XrResult XRAPI_CALL HookCreateReferenceSpace(XrSession session, const XrReferenceSpaceCreateInfo* createInfo, XrSpace* space)
+XrResult XRAPI_CALL HookCreateActionSpace(XrSession session, const XrActionSpaceCreateInfo* info, XrSpace* space)
 {
-    LayerState& s = State();
-    XrResult result = s.next.createReferenceSpace(session, createInfo, space);
-    if (XR_FAILED(result) || !createInfo || !space)
+    XrResult result = g_layer.next.createActionSpace(session, info, space);
+    if (XR_FAILED(result) || !info || !space)
         return result;
-    std::lock_guard lock(s.mutex);
-    s.referenceSpaces.emplace_back(*space, createInfo->referenceSpaceType);
+    std::lock_guard lock(g_mutex);
+    if (g_layer.aim != XR_NULL_HANDLE && info->action == g_layer.aim)
+        g_layer.aimSpaces.emplace_back(*space, info->subactionPath);
     return result;
 }
 
-XrResult XRAPI_CALL HookCreateActionSpace(XrSession session, const XrActionSpaceCreateInfo* createInfo, XrSpace* space)
+XrResult XRAPI_CALL HookLocateSpace(XrSpace space, XrSpace base, XrTime time, XrSpaceLocation* location)
 {
-    LayerState& s = State();
-    XrResult result = s.next.createActionSpace(session, createInfo, space);
-    if (XR_FAILED(result) || !createInfo || !space)
-        return result;
-    std::lock_guard lock(s.mutex);
-    if (s.aim == XR_NULL_HANDLE || createInfo->action != s.aim)
-        return result;
-    s.aimSpaces.push_back({*space, createInfo->subactionPath});
-    Log("aim space created for %s hand", HandName(s, createInfo->subactionPath));
-    return result;
-}
-
-XrResult XRAPI_CALL HookLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation* location)
-{
-    LayerState& s = State();
-    XrResult result = s.next.locateSpace(space, baseSpace, time, location);
+    XrResult result = g_layer.next.locateSpace(space, base, time, location);
     if (XR_FAILED(result) || !location)
         return result;
-    std::lock_guard lock(s.mutex);
-    RecordAimPose(s, space, baseSpace, time, location->locationFlags, location->pose);
+    std::lock_guard lock(g_mutex);
+    g_layer.RecordAim(space, base, time, location->locationFlags, location->pose);
     return result;
 }
 
-XrResult XRAPI_CALL HookLocateSpaces(XrSession session, const XrSpacesLocateInfo* locateInfo, XrSpaceLocations* spaceLocations)
+XrResult XRAPI_CALL HookLocateSpaces(XrSession session, const XrSpacesLocateInfo* info, XrSpaceLocations* locations)
 {
-    LayerState& s = State();
-    XrResult result = s.next.locateSpaces(session, locateInfo, spaceLocations);
-    if (XR_FAILED(result) || !locateInfo || !spaceLocations || !spaceLocations->locations)
+    XrResult result = g_layer.next.locateSpaces(session, info, locations);
+    if (XR_FAILED(result) || !info || !locations || !locations->locations)
         return result;
-    std::lock_guard lock(s.mutex);
-    uint32_t count = std::min(locateInfo->spaceCount, spaceLocations->locationCount);
-    for (uint32_t i = 0; i < count; ++i)
-        RecordAimPose(s, locateInfo->spaces[i], locateInfo->baseSpace, locateInfo->time, spaceLocations->locations[i].locationFlags,
-                      spaceLocations->locations[i].pose);
+    std::lock_guard lock(g_mutex);
+    for (uint32_t i = 0; i < std::min(info->spaceCount, locations->locationCount); ++i)
+        g_layer.RecordAim(info->spaces[i], info->baseSpace, info->time, locations->locations[i].locationFlags, locations->locations[i].pose);
     return result;
 }
 
-XrResult XRAPI_CALL HookLocateViews(XrSession session, const XrViewLocateInfo* viewLocateInfo, XrViewState* viewState, uint32_t viewCapacityInput,
-                                    uint32_t* viewCountOutput, XrView* views)
+XrResult XRAPI_CALL HookLocateViews(XrSession session, const XrViewLocateInfo* info, XrViewState* viewState, uint32_t capacity, uint32_t* count, XrView* views)
 {
-    LayerState& s = State();
-    XrResult result = s.next.locateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
-    if (XR_FAILED(result) || !viewLocateInfo || !viewState || !viewCountOutput || !views || viewCapacityInput == 0)
+    XrResult result = g_layer.next.locateViews(session, info, viewState, capacity, count, views);
+    if (XR_FAILED(result) || !info || !viewState || !count || !views || capacity == 0 || !(viewState->viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT))
         return result;
-    if (!(viewState->viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT))
-        return result;
-    std::lock_guard lock(s.mutex);
-    RecordHead(s, viewLocateInfo->space, viewLocateInfo->displayTime, views, std::min(*viewCountOutput, viewCapacityInput));
+    std::lock_guard lock(g_mutex);
+    g_layer.RecordHead(info->space, info->displayTime, views, std::min(*count, capacity));
     return result;
 }
 
-XrResult XRAPI_CALL HookSyncActions(XrSession session, const XrActionsSyncInfo* syncInfo)
+XrResult XRAPI_CALL HookSyncActions(XrSession session, const XrActionsSyncInfo* info)
 {
-    LayerState& s = State();
-    XrResult result = s.next.syncActions(session, syncInfo);
+    XrResult result = g_layer.next.syncActions(session, info);
     if (XR_FAILED(result))
         return result;
-
-    std::vector<std::string> commands;
+    std::vector<const char*> commands;
     {
-        std::lock_guard lock(s.mutex);
-        if (!s.loggedFirstSync)
-        {
-            s.loggedFirstSync = true;
-            Log("first xrSyncActions (%d)", result);
-        }
-        ++s.frame;
-        UpdateMenuState(s);
-        UpdateReloadState(s);
-        if (s.squeeze != XR_NULL_HANDLE)
-        {
-            UpdateSqueeze(s, session);
-            UpdateGunHand(s);
-            UpdateGrenade(s);
-        }
-        UpdateCrouch(s, session, commands);
-        UpdateCommandAction(s, session, s.tactical, s.tacticalButton, "tactical", s.config.tacticalPressCommand, s.config.tacticalReleaseCommand,
-                            commands);
-        UpdateTacticalHand(s);
-        UpdateTriggerOverride(s, session);
-        UpdateSprint(s, session);
+        std::lock_guard lock(g_mutex);
+        g_layer.Sync(session, g_config, commands);
     }
+    for (const char* command : commands)
+        Log("command '%s' %s", command, GameCommand(command) ? "sent" : "not sent");
+    return result;
+}
 
-    for (const std::string& command : commands)
+XrResult XRAPI_CALL HookGetActionStateFloat(XrSession session, const XrActionStateGetInfo* info, XrActionStateFloat* state)
+{
+    XrResult result = g_layer.next.getActionStateFloat(session, info, state);
+    if (XR_FAILED(result) || !info || !state)
+        return result;
+    std::lock_guard lock(g_mutex);
+    Layer& l = g_layer;
+    if (info->action == l.trigger)
     {
-        bool sent = EngineExecute(command.c_str());
-        Log("command '%s' %s", command.c_str(), sent ? "sent" : "not sent");
+        if (l.triggerApplies && info->subactionPath == l.tacticalHand)
+            Override(state, l.triggerOutput, l.triggerChanged, l.triggerChangeTime);
+    }
+    else if (info->action == l.squeeze)
+    {
+        const Grip* grip = l.FindGrip(info->subactionPath);
+        if (grip && grip->sampled)
+            Override(state, grip->output, grip->changed, grip->changeTime);
     }
     return result;
 }
 
-XrResult XRAPI_CALL HookGetActionStateFloat(XrSession session, const XrActionStateGetInfo* getInfo, XrActionStateFloat* state)
+XrResult XRAPI_CALL HookGetActionStateBoolean(XrSession session, const XrActionStateGetInfo* info, XrActionStateBoolean* state)
 {
-    LayerState& s = State();
-    XrResult result = s.next.getActionStateFloat(session, getInfo, state);
-    if (XR_FAILED(result) || !getInfo || !state)
+    XrResult result = g_layer.next.getActionStateBoolean(session, info, state);
+    if (XR_FAILED(result) || !info || !state)
         return result;
-
-    std::lock_guard lock(s.mutex);
-    if (s.trigger != XR_NULL_HANDLE && getInfo->action == s.trigger)
+    std::lock_guard lock(g_mutex);
+    const Layer& l = g_layer;
+    if (info->action == l.jump && info->subactionPath == l.right)
     {
-        const TriggerOverride& o = s.triggerOverride;
-        if (!o.applies || getInfo->subactionPath != s.tacticalHand)
-            return result;
-        state->isActive = XR_TRUE;
-        state->currentState = o.output;
-        state->changedSinceLastSync = o.changed ? XR_TRUE : XR_FALSE;
-        if (o.changed && o.changeTime != 0)
-            state->lastChangeTime = o.changeTime;
-        return result;
+        if (l.jumpOverride || l.jumpChanged)
+            Override(state, l.jumpOutput, l.jumpChanged, 0);
     }
-
-    if (s.squeeze == XR_NULL_HANDLE || getInfo->action != s.squeeze)
-        return result;
-    if (s.loggedSqueezeQueries < kMaxLoggedQueries)
+    else if (info->action == l.stickClick && info->subactionPath == l.left)
     {
-        ++s.loggedSqueezeQueries;
-        Log("app queried squeeze with subaction path %s", PathText(s, getInfo->subactionPath).c_str());
+        if (l.sprintPressed || l.sprintChanged)
+            Override(state, l.sprintOutput, l.sprintChanged, l.sprintChangeTime);
     }
-
-    GripSlot* grip = FindGrip(s, getInfo->subactionPath);
-    if (!grip || !grip->sampled)
-        return result;
-    state->isActive = XR_TRUE;
-    state->currentState = grip->output;
-    state->changedSinceLastSync = grip->changed ? XR_TRUE : XR_FALSE;
-    if (grip->changed && grip->changeTime != 0)
-        state->lastChangeTime = grip->changeTime;
     return result;
 }
 
-XrResult XRAPI_CALL HookGetActionStateBoolean(XrSession session, const XrActionStateGetInfo* getInfo, XrActionStateBoolean* state)
+XrResult XRAPI_CALL HookGetActionStateVector2f(XrSession session, const XrActionStateGetInfo* info, XrActionStateVector2f* state)
 {
-    LayerState& s = State();
-    XrResult result = s.next.getActionStateBoolean(session, getInfo, state);
-    if (XR_FAILED(result) || !getInfo || !state)
+    XrResult result = g_layer.next.getActionStateVector2f(session, info, state);
+    if (XR_FAILED(result) || !info || !state)
         return result;
-
-    std::lock_guard lock(s.mutex);
-    bool watched = (s.jump != XR_NULL_HANDLE && getInfo->action == s.jump) || (s.stickClick != XR_NULL_HANDLE && getInfo->action == s.stickClick);
-    if (watched && s.loggedBooleanQueries < kMaxLoggedQueries * 2)
-    {
-        ++s.loggedBooleanQueries;
-        Log("app queried %s with subaction path %s", getInfo->action == s.jump ? "jump button" : "stick_click", PathText(s, getInfo->subactionPath).c_str());
-    }
-    if (s.jump != XR_NULL_HANDLE && getInfo->action == s.jump && getInfo->subactionPath == s.jumpHand)
-    {
-        const CrouchState& c = s.crouchState;
-        if (!c.jumpOverride && !c.jumpChanged)
-            return result;
-        state->isActive = XR_TRUE;
-        state->currentState = c.jumpOutput ? XR_TRUE : XR_FALSE;
-        state->changedSinceLastSync = c.jumpChanged ? XR_TRUE : XR_FALSE;
+    std::lock_guard lock(g_mutex);
+    if (info->action != g_layer.stick || info->subactionPath != g_layer.left)
         return result;
-    }
-    if (s.stickClick == XR_NULL_HANDLE || getInfo->action != s.stickClick || getInfo->subactionPath != s.sprintHand)
-        return result;
-    const SprintState& sprint = s.sprint;
-    if (!sprint.pressed && !sprint.changed)
-        return result;
-    state->isActive = XR_TRUE;
-    state->currentState = sprint.output ? XR_TRUE : XR_FALSE;
-    state->changedSinceLastSync = sprint.changed ? XR_TRUE : XR_FALSE;
-    if (sprint.changed && sprint.changeTime != 0)
-        state->lastChangeTime = sprint.changeTime;
-    return result;
-}
-
-XrResult XRAPI_CALL HookGetActionStateVector2f(XrSession session, const XrActionStateGetInfo* getInfo, XrActionStateVector2f* state)
-{
-    LayerState& s = State();
-    XrResult result = s.next.getActionStateVector2f(session, getInfo, state);
-    if (XR_FAILED(result) || !getInfo || !state)
-        return result;
-
-    std::lock_guard lock(s.mutex);
-    if (s.stick != XR_NULL_HANDLE && getInfo->action == s.stick && s.loggedStickQueries < kMaxLoggedQueries)
-    {
-        ++s.loggedStickQueries;
-        Log("app queried stick with subaction path %s", PathText(s, getInfo->subactionPath).c_str());
-    }
-    if (s.stick == XR_NULL_HANDLE || getInfo->action != s.stick || getInfo->subactionPath != s.sprintHand)
-        return result;
-    if (s.sprint.stickZeroed)
-    {
+    if (g_layer.stickZeroed)
         state->currentState = {0.0f, 0.0f};
-        state->changedSinceLastSync = s.sprint.stickChanged ? XR_TRUE : state->changedSinceLastSync;
-    }
-    else if (s.sprint.stickChanged)
+    if (g_layer.stickChanged)
         state->changedSinceLastSync = XR_TRUE;
     return result;
 }
-
-struct Hook
-{
-    const char* name;
-    PFN_xrVoidFunction function;
-};
-
-const Hook kHooks[] = {
-    {"xrGetInstanceProcAddr", reinterpret_cast<PFN_xrVoidFunction>(&LayerGetInstanceProcAddr)},
-    {"xrDestroyInstance", reinterpret_cast<PFN_xrVoidFunction>(&HookDestroyInstance)},
-    {"xrCreateActionSet", reinterpret_cast<PFN_xrVoidFunction>(&HookCreateActionSet)},
-    {"xrCreateAction", reinterpret_cast<PFN_xrVoidFunction>(&HookCreateAction)},
-    {"xrSyncActions", reinterpret_cast<PFN_xrVoidFunction>(&HookSyncActions)},
-    {"xrGetActionStateFloat", reinterpret_cast<PFN_xrVoidFunction>(&HookGetActionStateFloat)},
-    {"xrGetActionStateBoolean", reinterpret_cast<PFN_xrVoidFunction>(&HookGetActionStateBoolean)},
-    {"xrGetActionStateVector2f", reinterpret_cast<PFN_xrVoidFunction>(&HookGetActionStateVector2f)},
-    {"xrCreateReferenceSpace", reinterpret_cast<PFN_xrVoidFunction>(&HookCreateReferenceSpace)},
-    {"xrCreateActionSpace", reinterpret_cast<PFN_xrVoidFunction>(&HookCreateActionSpace)},
-    {"xrLocateSpace", reinterpret_cast<PFN_xrVoidFunction>(&HookLocateSpace)},
-    {"xrLocateSpaces", reinterpret_cast<PFN_xrVoidFunction>(&HookLocateSpaces)},
-    {"xrLocateViews", reinterpret_cast<PFN_xrVoidFunction>(&HookLocateViews)},
-};
 
 XrResult XRAPI_CALL LayerGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function)
 {
     if (!name || !function)
         return XR_ERROR_VALIDATION_FAILURE;
-
-    LayerState& s = State();
-    if (s.active)
+    static const std::pair<const char*, PFN_xrVoidFunction> hooks[] = {
+        {"xrGetInstanceProcAddr", reinterpret_cast<PFN_xrVoidFunction>(&LayerGetInstanceProcAddr)},
+        {"xrCreateActionSet", reinterpret_cast<PFN_xrVoidFunction>(&HookCreateActionSet)},
+        {"xrCreateAction", reinterpret_cast<PFN_xrVoidFunction>(&HookCreateAction)},
+        {"xrSyncActions", reinterpret_cast<PFN_xrVoidFunction>(&HookSyncActions)},
+        {"xrGetActionStateFloat", reinterpret_cast<PFN_xrVoidFunction>(&HookGetActionStateFloat)},
+        {"xrGetActionStateBoolean", reinterpret_cast<PFN_xrVoidFunction>(&HookGetActionStateBoolean)},
+        {"xrGetActionStateVector2f", reinterpret_cast<PFN_xrVoidFunction>(&HookGetActionStateVector2f)},
+        {"xrCreateActionSpace", reinterpret_cast<PFN_xrVoidFunction>(&HookCreateActionSpace)},
+        {"xrLocateSpace", reinterpret_cast<PFN_xrVoidFunction>(&HookLocateSpace)},
+        {"xrLocateViews", reinterpret_cast<PFN_xrVoidFunction>(&HookLocateViews)},
+    };
+    if (g_active)
     {
-        for (const Hook& hook : kHooks)
+        for (const auto& [hookName, hook] : hooks)
         {
-            if (std::strcmp(hook.name, name) == 0 && (hook.function != reinterpret_cast<PFN_xrVoidFunction>(&HookLocateSpaces) || s.next.locateSpaces))
+            if (std::strcmp(hookName, name) == 0)
             {
-                *function = hook.function;
+                *function = hook;
                 return XR_SUCCESS;
             }
         }
+        if (std::strcmp(name, "xrLocateSpaces") == 0 && g_layer.next.locateSpaces)
+        {
+            *function = reinterpret_cast<PFN_xrVoidFunction>(&HookLocateSpaces);
+            return XR_SUCCESS;
+        }
     }
-
-    if (!s.next.getInstanceProcAddr)
+    if (!g_layer.next.getInstanceProcAddr)
     {
         *function = nullptr;
         return XR_ERROR_HANDLE_INVALID;
     }
-    return s.next.getInstanceProcAddr(instance, name, function);
+    return g_layer.next.getInstanceProcAddr(instance, name, function);
 }
 
 XrResult XRAPI_CALL LayerCreateApiLayerInstance(const XrInstanceCreateInfo* info, const XrApiLayerCreateInfo* layerInfo, XrInstance* instance)
 {
     if (!layerInfo || !layerInfo->nextInfo || !layerInfo->nextInfo->nextGetInstanceProcAddr || !layerInfo->nextInfo->nextCreateApiLayerInstance)
         return XR_ERROR_INITIALIZATION_FAILED;
-
-    InitializeOnce();
-    LayerState& s = State();
-
     XrApiLayerCreateInfo chained = *layerInfo;
     chained.nextInfo = layerInfo->nextInfo->next;
     XrResult result = layerInfo->nextInfo->nextCreateApiLayerInstance(info, &chained, instance);
     if (XR_FAILED(result))
-    {
-        Log("next xrCreateApiLayerInstance failed (%d)", result);
-        return result;
-    }
-
-    std::lock_guard lock(s.mutex);
-    s.instance = *instance;
-    s.next = {};
-    s.next.getInstanceProcAddr = layerInfo->nextInfo->nextGetInstanceProcAddr;
-    if (!s.active)
         return result;
 
-    if (info)
-        Log("instance created for app '%s' engine '%s'", info->applicationInfo.applicationName, info->applicationInfo.engineName);
-
-    bool resolved = ResolveNext(s, "xrDestroyInstance", s.next.destroyInstance) &&
-                    ResolveNext(s, "xrStringToPath", s.next.stringToPath) &&
-                    ResolveNext(s, "xrPathToString", s.next.pathToString) &&
-                    ResolveNext(s, "xrCreateActionSet", s.next.createActionSet) &&
-                    ResolveNext(s, "xrCreateAction", s.next.createAction) &&
-                    ResolveNext(s, "xrSyncActions", s.next.syncActions) &&
-                    ResolveNext(s, "xrGetActionStateFloat", s.next.getActionStateFloat) &&
-                    ResolveNext(s, "xrGetActionStateBoolean", s.next.getActionStateBoolean) &&
-                    ResolveNext(s, "xrGetActionStateVector2f", s.next.getActionStateVector2f) &&
-                    ResolveNext(s, "xrCreateReferenceSpace", s.next.createReferenceSpace) &&
-                    ResolveNext(s, "xrCreateActionSpace", s.next.createActionSpace) &&
-                    ResolveNext(s, "xrLocateSpace", s.next.locateSpace) &&
-                    ResolveNext(s, "xrLocateViews", s.next.locateViews);
-    if (!resolved)
+    std::lock_guard lock(g_mutex);
+    g_layer = Layer{};
+    g_layer.instance = *instance;
+    g_layer.next.getInstanceProcAddr = layerInfo->nextInfo->nextGetInstanceProcAddr;
+    if (!g_active)
+        return result;
+    if (!g_layer.Resolve())
     {
         Log("layer disabled: next functions unavailable");
-        s.active = false;
+        g_active = false;
         return result;
     }
-
-    s.leftHand = ToPath(s, "/user/hand/left");
-    s.rightHand = ToPath(s, "/user/hand/right");
-    s.tacticalHand = s.config.tacticalHand == "left" ? s.leftHand : s.config.tacticalHand == "right" ? s.rightHand : XR_NULL_PATH;
-    PFN_xrVoidFunction locateSpaces = nullptr;
-    if (XR_SUCCEEDED(s.next.getInstanceProcAddr(s.instance, "xrLocateSpaces", &locateSpaces)))
-        s.next.locateSpaces = reinterpret_cast<PFN_xrLocateSpaces>(locateSpaces);
-    s.jumpHand = s.rightHand;
-    s.sprintHand = s.config.sprintHand == "left" ? s.leftHand : s.config.sprintHand == "right" ? s.rightHand : XR_NULL_PATH;
-    s.gunHand = s.rightHand;
-    if (s.config.tacticalHand == "auto")
-        s.tacticalHand = s.leftHand;
-    Log("gun hand right until a gun is drawn or picked up");
+    g_layer.left = g_layer.ToPath("/user/hand/left");
+    g_layer.right = g_layer.ToPath("/user/hand/right");
+    g_layer.gunHand = g_layer.right;
+    g_layer.tacticalHand = g_layer.left;
     return result;
 }
-}
-}
 
-extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderApiLayerInterface(const XrNegotiateLoaderInfo* loaderInfo, const char* layerName, XrNegotiateApiLayerRequest* request)
+void Initialize()
 {
-    (void)layerName;
-    if (!loaderInfo || !request)
-        return XR_ERROR_INITIALIZATION_FAILED;
-    if (loaderInfo->structType != XR_LOADER_INTERFACE_STRUCT_LOADER_INFO || loaderInfo->structVersion != XR_LOADER_INFO_STRUCT_VERSION ||
-        loaderInfo->structSize != sizeof(XrNegotiateLoaderInfo))
-        return XR_ERROR_INITIALIZATION_FAILED;
-    if (request->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_REQUEST || request->structVersion != XR_API_LAYER_INFO_STRUCT_VERSION ||
-        request->structSize != sizeof(XrNegotiateApiLayerRequest))
-        return XR_ERROR_INITIALIZATION_FAILED;
-    if (loaderInfo->minInterfaceVersion > XR_CURRENT_LOADER_API_LAYER_VERSION || loaderInfo->maxInterfaceVersion < XR_CURRENT_LOADER_API_LAYER_VERSION)
-        return XR_ERROR_INITIALIZATION_FAILED;
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    const wchar_t* slash = std::wcsrchr(path, L'\\');
+    g_active = _wcsicmp(slash ? slash + 1 : path, L"Titanfall2VRLauncher.exe") == 0;
+    if (!g_active)
+        return;
+    HMODULE module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&Initialize), &module);
+    GetModuleFileNameW(module, path, MAX_PATH);
+    std::wstring directory = path;
+    directory.resize(directory.find_last_of(L"\\/") + 1);
+    g_config = LoadConfig(directory + L"TF2VRBetterBindings.ini");
+    LogOpen(directory + L"TF2VRBetterBindings.log");
+    Log("config: reload_grab=%d grenade_toggle=%d crouch_mode=%s uncrouch_on_jump=%d jump_delay_ms=%d block_hand_trigger_in_game=%d sprint=%d "
+        "start_below_eyes_cm=%d stop_below_eyes_cm=%d",
+        g_config.reloadGrab, g_config.grenadeToggle, g_config.crouchButtonMode ? "button" : "toggle", g_config.uncrouchOnJump, g_config.jumpDelayMs,
+        g_config.blockTrigger, g_config.sprint, g_config.sprintStartCm, g_config.sprintStopCm);
+}
+}
 
+extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderApiLayerInterface(const XrNegotiateLoaderInfo* loaderInfo, const char*, XrNegotiateApiLayerRequest* request)
+{
+    if (!loaderInfo || !request || loaderInfo->structType != XR_LOADER_INTERFACE_STRUCT_LOADER_INFO || loaderInfo->structVersion != XR_LOADER_INFO_STRUCT_VERSION ||
+        loaderInfo->structSize != sizeof(XrNegotiateLoaderInfo) || request->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_REQUEST ||
+        request->structVersion != XR_API_LAYER_INFO_STRUCT_VERSION || request->structSize != sizeof(XrNegotiateApiLayerRequest) ||
+        loaderInfo->minInterfaceVersion > XR_CURRENT_LOADER_API_LAYER_VERSION || loaderInfo->maxInterfaceVersion < XR_CURRENT_LOADER_API_LAYER_VERSION)
+        return XR_ERROR_INITIALIZATION_FAILED;
     XrVersion apiVersion = std::min<XrVersion>(XR_CURRENT_API_VERSION, loaderInfo->maxApiVersion);
     if (apiVersion < loaderInfo->minApiVersion)
         return XR_ERROR_INITIALIZATION_FAILED;
 
-    tf2vr::InitializeOnce();
+    static std::once_flag once;
+    std::call_once(once, Initialize);
     request->layerInterfaceVersion = XR_CURRENT_LOADER_API_LAYER_VERSION;
     request->layerApiVersion = apiVersion;
-    request->getInstanceProcAddr = tf2vr::LayerGetInstanceProcAddr;
-    request->createApiLayerInstance = tf2vr::LayerCreateApiLayerInstance;
+    request->getInstanceProcAddr = LayerGetInstanceProcAddr;
+    request->createApiLayerInstance = LayerCreateApiLayerInstance;
     return XR_SUCCESS;
 }
